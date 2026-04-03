@@ -1149,28 +1149,6 @@ let _dataLoaded = false;
 let _loadingOverlay = null;
 
 async function initFirebaseData() {
-  _loadingOverlay = document.createElement('div');
-  _loadingOverlay.id = 'fb-loading';
-  _loadingOverlay.style.cssText = `
-    position:fixed;inset:0;background:rgba(31,40,75,.92);z-index:99999;
-    display:flex;flex-direction:column;align-items:center;justify-content:center;
-    color:#fff;font-family:Arial,sans-serif;gap:18px;
-  `;
-  _loadingOverlay.innerHTML = `
-    <div style="font-size:48px">☁️</div>
-    <div style="font-size:20px;font-weight:700">Connexion à Firebase...</div>
-    <div style="font-size:14px;opacity:.7">Chargement des données de la base de données</div>
-    <div style="width:200px;height:4px;background:rgba(255,255,255,.2);border-radius:2px;overflow:hidden;margin-top:8px">
-      <div id="fb-progress" style="width:0%;height:100%;background:#17A399;border-radius:2px;transition:width .4s ease"></div>
-    </div>
-  `;
-  document.body.appendChild(_loadingOverlay);
-
-  const setProgress = (pct) => {
-    const bar = document.getElementById('fb-progress');
-    if (bar) bar.style.width = pct + '%';
-  };
-
   try {
     const keys = [
       'gf3_orders','gf3_inv_papier','gf3_inv_fourni','gf3_inv_mobilier',
@@ -1178,28 +1156,23 @@ async function initFirebaseData() {
       'gf4_directions','gf4_fields','gf4_messages','gf4_cv','gf4_cvo',
       'gf4_ectr','gf4_cctr','gf_session'
     ];
-    let loaded = 0;
-    // Charger toutes les clés en parallèle
+
     await Promise.all(keys.map(async k => {
-      await FS.get(k);
-      loaded++;
-      setProgress(Math.round(loaded / keys.length * 100));
+      try {
+        await FS.get(k);
+      } catch(e) {
+        console.warn("Erreur clé :", k);
+      }
     }));
 
-    _dataLoaded = true;
-    console.log('✅ Firebase data loaded');
+    console.log("✅ Firebase OK");
+
   } catch(e) {
-    console.error('Firebase init error', e);
-    // En cas d'erreur, on continue quand même
-    _dataLoaded = true;
+    console.warn("⚠️ Firebase HS → mode local activé");
   }
 
-  // Retirer l'overlay
-  if (_loadingOverlay) {
-    _loadingOverlay.style.opacity = '0';
-    _loadingOverlay.style.transition = 'opacity .4s';
-    setTimeout(() => _loadingOverlay?.remove(), 400);
-  }
+  // 🔥 IMPORTANT : toujours lancer l'app
+  init();
 }
 
 /* ============================================================
@@ -2720,8 +2693,7 @@ function init(){
 }
 // Démarrage — attendre Firebase avant d'initialiser l'app
 (function(){
-  initFirebaseData().then(() => {
-    init();
+initFirebaseData();
   }).catch(err => {
     console.error('Erreur Firebase, démarrage en mode local:', err);
     init(); // fallback
