@@ -74,6 +74,9 @@
 
 .barch{display:inline-flex;align-items:center;gap:7px;padding:9px 18px;background:linear-gradient(135deg,#3FA535,#2d7a26);color:#fff;border:none;border-radius:22px;font-family:Arial,Helvetica,sans-serif;font-size:13px;font-weight:700;cursor:pointer;transition:all .2s;white-space:nowrap;box-shadow:0 3px 10px rgba(63,165,53,.35);letter-spacing:.2px;}.barch:hover{background:linear-gradient(135deg,#2d7a26,#1d5233);transform:translateY(-1px);box-shadow:0 5px 16px rgba(63,165,53,.45);}.barch:active{transform:translateY(0);box-shadow:0 2px 6px rgba(63,165,53,.3);}
 </style>
+<!-- Firebase SDK -->
+<script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-firestore-compat.js"></script>
 </head>
 <body>
 <div class="toast" id="toast"></div>
@@ -1069,9 +1072,291 @@
 
 <script data-cfasync="false" src="/cdn-cgi/scripts/5c5dd728/cloudflare-static/email-decode.min.js"></script><script data-cfasync="false" src="/cdn-cgi/scripts/5c5dd728/cloudflare-static/email-decode.min.js"></script><script data-cfasync="false" src="/cdn-cgi/scripts/5c5dd728/cloudflare-static/email-decode.min.js"></script><script>const EXTRA_CATS = ["Impression", "Photo", "Premium", "Eco", "Recyclé", "Papier standard", "Papier spécial", "Papier couleur", "Papier photo", "Papier épais", "Transparents", "Étiquettes adhésives", "Pochettes plastification", "Intercalaires papier", "Cartonné", "Bristol", "Kraft", "Papier calque", "Millimétré", "Quadrillé", "Enveloppes fenêtre", "Enveloppes kraft", "Enveloppes bulle", "Ramettes", "Bobines", "Rouleaux"];
 
+/* ============================================================
+   FIREBASE FIRESTORE — Configuration GestiFournitures v8
+   Remplacez les valeurs ci-dessous par celles de votre console Firebase
+   ============================================================ */
+// Import the functions you need from the SDKs you need
+import { initializeApp } from "firebase/app";
+// TODO: Add SDKs for Firebase products that you want to use
+// https://firebase.google.com/docs/web/setup#available-libraries
+
+// Your web app's Firebase configuration
+const firebaseConfig = {
+  apiKey: "AIzaSyD4xyj75aCMt4p9yMdzW2xFZIx59g7DlmQ",
+  authDomain: "gestifournitures.firebaseapp.com",
+  projectId: "gestifournitures",
+  storageBucket: "gestifournitures.firebasestorage.app",
+  messagingSenderId: "857827909082",
+  appId: "1:857827909082:web:1ecc8775bccb605534b4e3"
+};
+
+// Initialize Firebase
+const app = initializeApp(firebaseConfig);
+
+/* ============================================================
+   CACHE LOCAL en mémoire (pour performances + mode hors-ligne)
+   ============================================================ */
+const _cache = {};
+
+/* ============================================================
+   COUCHE D'ABSTRACTION FIREBASE (remplace localStorage)
+   Toutes les fonctions sont asynchrones.
+   Un cache mémoire évite les lectures répétées.
+   ============================================================ */
+const FS = {
+  async get(key) {
+    if (_cache[key] !== undefined) return _cache[key];
+    try {
+      const doc = await db.collection('gf_data').doc(key).get();
+      const val = doc.exists ? doc.data().value : null;
+      _cache[key] = val;
+      return val;
+    } catch(e) {
+      console.warn('Firebase read error', key, e);
+      // Fallback localStorage
+      try { return JSON.parse(localStorage.getItem(key)); } catch { return null; }
+    }
+  },
+  async set(key, value) {
+    _cache[key] = value;
+    try {
+      await db.collection('gf_data').doc(key).set({ value, updatedAt: firebase.firestore.FieldValue.serverTimestamp() });
+    } catch(e) {
+      console.warn('Firebase write error', key, e);
+      // Fallback localStorage
+      localStorage.setItem(key, JSON.stringify(value));
+    }
+  },
+  del(key) {
+    delete _cache[key];
+    try { db.collection('gf_data').doc(key).delete(); } catch {}
+    localStorage.removeItem(key);
+  }
+};
+
+/* ============================================================
+   INITIALISATION — Chargement de toutes les données au démarrage
+   ============================================================ */
+let _dataLoaded = false;
+let _loadingOverlay = null;
+
+async function initFirebaseData() {
+  _loadingOverlay = document.createElement('div');
+  _loadingOverlay.id = 'fb-loading';
+  _loadingOverlay.style.cssText = `
+    position:fixed;inset:0;background:rgba(31,40,75,.92);z-index:99999;
+    display:flex;flex-direction:column;align-items:center;justify-content:center;
+    color:#fff;font-family:Arial,sans-serif;gap:18px;
+  `;
+  _loadingOverlay.innerHTML = `
+    <div style="font-size:48px">☁️</div>
+    <div style="font-size:20px;font-weight:700">Connexion à Firebase...</div>
+    <div style="font-size:14px;opacity:.7">Chargement des données de la base de données</div>
+    <div style="width:200px;height:4px;background:rgba(255,255,255,.2);border-radius:2px;overflow:hidden;margin-top:8px">
+      <div id="fb-progress" style="width:0%;height:100%;background:#17A399;border-radius:2px;transition:width .4s ease"></div>
+    </div>
+  `;
+  document.body.appendChild(_loadingOverlay);
+
+  const setProgress = (pct) => {
+    const bar = document.getElementById('fb-progress');
+    if (bar) bar.style.width = pct + '%';
+  };
+
+  try {
+    const keys = [
+      'gf3_orders','gf3_inv_papier','gf3_inv_fourni','gf3_inv_mobilier',
+      'gf3_hist','gf3_ctr','gf4_accounts','gf4_entretien','gf4_courrier',
+      'gf4_directions','gf4_fields','gf4_messages','gf4_cv','gf4_cvo',
+      'gf4_ectr','gf4_cctr','gf_session'
+    ];
+    let loaded = 0;
+    // Charger toutes les clés en parallèle
+    await Promise.all(keys.map(async k => {
+      await FS.get(k);
+      loaded++;
+      setProgress(Math.round(loaded / keys.length * 100));
+    }));
+
+    _dataLoaded = true;
+    console.log('✅ Firebase data loaded');
+  } catch(e) {
+    console.error('Firebase init error', e);
+    // En cas d'erreur, on continue quand même
+    _dataLoaded = true;
+  }
+
+  // Retirer l'overlay
+  if (_loadingOverlay) {
+    _loadingOverlay.style.opacity = '0';
+    _loadingOverlay.style.transition = 'opacity .4s';
+    setTimeout(() => _loadingOverlay?.remove(), 400);
+  }
+}
+
+/* ============================================================
+   REMPLACEMENT DES FONCTIONS SYNC PAR ASYNC FIREBASE
+   ============================================================ */
+
+// Compteur de commandes
+const getCounter = () => _cache['gf3_ctr'] || 1;
+const saveCounter = async n => { await FS.set('gf3_ctr', n); };
+
+// Comptes utilisateurs
+const DEFAULT_ACCOUNTS = {
+  direction: { hash:'Admin1234', nom:'Direction Générale', service:'Direction Générale des Services', role:'admin' },
+  admin: { hash:'Admin5678', nom:'Administrateur', service:'Service Informatique', role:'admin' }
+};
+const getAccounts = () => _cache['gf4_accounts'] || DEFAULT_ACCOUNTS;
+const saveAccounts = async a => { await FS.set('gf4_accounts', a); };
+
+// Commandes
+const getOrders = () => _cache['gf3_orders'] || [];
+const saveOrders = async o => { await FS.set('gf3_orders', o); };
+
+// Inventaire
+const getInv = volet => {
+  const _v = _cache['gf3_inv_' + volet];
+  const arr = (_v && _v.length > 0) ? _v : CATALOGUE[volet].map(a => ({...a}));
+  return arr.filter(a => a != null && typeof a === 'object');
+};
+const saveInv = async (v, i) => { await FS.set('gf3_inv_' + v, i); };
+
+// Historique
+const getHist = () => _cache['gf3_hist'] || [];
+const saveHist = async h => { await FS.set('gf3_hist', h); };
+
+// Entretien
+const getEntretien = () => _cache['gf4_entretien'] || [];
+const saveEntretien = async e => { await FS.set('gf4_entretien', e); };
+
+// Courrier
+const getCourriers = () => _cache['gf4_courrier'] || [];
+const saveCourriers = async c => { await FS.set('gf4_courrier', c); };
+
+// Directions
+const DEFAULT_DIRECTIONS = [
+  'Direction Générale des Services','Direction des Finances','Direction des Ressources Humaines',
+  'Direction des Affaires Juridiques','Direction de l\'Education','Direction de la Culture',
+  'Direction des Sports','Direction des Affaires Sociales','Direction Technique',
+  'Direction du Développement Durable','Direction de la Communication','Direction de l\'Informatique',
+  'Direction de l\'Urbanisme','Police Municipale','Autre'
+];
+const getDirections = () => _cache['gf4_directions'] || [...DEFAULT_DIRECTIONS];
+const saveDirections = async d => { await FS.set('gf4_directions', d); };
+
+// Champs de formulaire
+const getFieldsConf = () => _cache['gf4_fields'] || JSON.parse(JSON.stringify(DEFAULT_FIELDS));
+const saveFieldsConf = async f => { await FS.set('gf4_fields', f); };
+
+// Messages
+const getMessages = () => _cache['gf4_messages'] || {};
+const saveMessages = async m => { await FS.set('gf4_messages', m); };
+
+// Volets custom
+const getCV = () => _cache['gf4_cv'] || [];
+const saveCV = async v => { await FS.set('gf4_cv', v); };
+const getCVO = () => _cache['gf4_cvo'] || [];
+const saveCVO = async v => { await FS.set('gf4_cvo', v); };
+
+// Session (localStorage uniquement — locale)
+const getSession = () => { try { return JSON.parse(localStorage.getItem('gf_session')); } catch { return null; } };
+const setSession = s => { try { localStorage.setItem('gf_session', JSON.stringify(s)); } catch {} };
+const clearSession = () => { try { localStorage.removeItem('gf_session'); } catch {} };
+
+/* ============================================================
+   SURCHARGE des fonctions Login / Logout / Init session
+   ============================================================ */
+function doLogin() {
+  const u = document.getElementById('l-u').value.trim();
+  const p = document.getElementById('l-p').value;
+  const accounts = getAccounts();
+  if (accounts[u] && accounts[u].hash === p) {
+    session = { user: u, nom: accounts[u].nom };
+    setSession(session);
+    document.getElementById('lerr').classList.remove('on');
+    nav('direction');
+  } else {
+    document.getElementById('lerr').classList.add('on');
+  }
+}
+
+function doLogout() {
+  session = { user: null, nom: null };
+  clearSession();
+  nav('agent');
+}
+
+/* ============================================================
+   SAUVEGARDE / RESTAURATION JSON (Firebase export/import)
+   ============================================================ */
+async function saveBackup() {
+  const data = {
+    version: 'gf8-firebase',
+    date: new Date().toISOString(),
+    orders: getOrders(),
+    inv_papier: getInv('papier'),
+    inv_fourni: getInv('fourni'),
+    inv_mobilier: getInv('mobilier'),
+    hist: getHist(),
+    counter: getCounter(),
+    accounts: getAccounts(),
+    entretien: getEntretien(),
+    courrier: getCourriers(),
+    directions: getDirections(),
+    fields: getFieldsConf(),
+    messages: getMessages(),
+    cv: getCV(),
+    cvo: getCVO()
+  };
+  const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `backup_gestifournitures_${new Date().toLocaleDateString('fr-FR').replace(/\//g,'-')}.json`;
+  a.click();
+  URL.revokeObjectURL(url);
+  toast('💾 Sauvegarde téléchargée');
+}
+
+async function restoreBackup(input) {
+  const file = input.files[0];
+  if (!file) return;
+  if (!confirm('⚠️ Restaurer cette sauvegarde ? Toutes les données actuelles seront remplacées.')) { input.value=''; return; }
+  const reader = new FileReader();
+  reader.onload = async e => {
+    try {
+      const data = JSON.parse(e.target.result);
+      if (data.orders) await saveOrders(data.orders); _cache['gf3_orders'] = data.orders || [];
+      if (data.inv_papier) { await saveInv('papier', data.inv_papier); _cache['gf3_inv_papier'] = data.inv_papier; }
+      if (data.inv_fourni) { await saveInv('fourni', data.inv_fourni); _cache['gf3_inv_fourni'] = data.inv_fourni; }
+      if (data.inv_mobilier) { await saveInv('mobilier', data.inv_mobilier); _cache['gf3_inv_mobilier'] = data.inv_mobilier; }
+      if (data.hist) { await saveHist(data.hist); _cache['gf3_hist'] = data.hist; }
+      if (data.counter) { await saveCounter(data.counter); _cache['gf3_ctr'] = data.counter; }
+      if (data.accounts) { await saveAccounts(data.accounts); _cache['gf4_accounts'] = data.accounts; }
+      if (data.entretien) { await saveEntretien(data.entretien); _cache['gf4_entretien'] = data.entretien; }
+      if (data.courrier) { await saveCourriers(data.courrier); _cache['gf4_courrier'] = data.courrier; }
+      if (data.directions) { await saveDirections(data.directions); _cache['gf4_directions'] = data.directions; }
+      if (data.fields) { await saveFieldsConf(data.fields); _cache['gf4_fields'] = data.fields; }
+      if (data.messages) { await saveMessages(data.messages); _cache['gf4_messages'] = data.messages; }
+      if (data.cv) { await saveCV(data.cv); _cache['gf4_cv'] = data.cv; }
+      if (data.cvo) { await saveCVO(data.cvo); _cache['gf4_cvo'] = data.cvo; }
+      input.value = '';
+      toast('✅ Sauvegarde restaurée depuis Firebase');
+      setTimeout(() => location.reload(), 1200);
+    } catch(err) {
+      toast('❌ Erreur lors de la restauration', true);
+      console.error(err);
+    }
+  };
+  reader.readAsText(file);
+}
 
 
-const DEFAULT_ACCOUNTS = {direction: { hash:'Admin1234', nom:'Direction Générale', service:'Direction Générale des Services', role:'admin' },admin: { hash:'Admin5678', nom:'Administrateur', service:'Service Informatique', role:'admin' }};const getAccounts = () => LS.get('gf4_accounts') || DEFAULT_ACCOUNTS;const saveAccounts = a => LS.set('gf4_accounts', a);const VOLETS = ['papier','fourni','mobilier'];const VOLET_LABELS = { papier:'Papier', fourni:'Fournitures', mobilier:'Mobilier' };const CATALOGUE = {papier: [
+
+
+/* Comptes définis dans initFirebaseData */const VOLETS = ['papier','fourni','mobilier'];const VOLET_LABELS = { papier:'Papier', fourni:'Fournitures', mobilier:'Mobilier' };const CATALOGUE = {papier: [
 { id:'drf-878840', icone:'✉️', nom:'navette', ref:'878840', unite:'unité(s)', categorie:'Enveloppes', stock:0, seuil:1 }
 ],
 fourni: [
@@ -1207,8 +1492,8 @@ mobilier: [
 { id:'drf-547874', icone:'🗄️', nom:'V (unité)', ref:'547874', unite:'unité(s)', categorie:'Tiroir Dossiers suspendus', stock:0, seuil:1 },
 { id:'drf-672761', icone:'🗄️', nom:'15 mm (unité)', ref:'672761', unite:'unité(s)', categorie:'Tiroir Dossiers suspendus', stock:0, seuil:1 },
 { id:'drf-465656', icone:'🗄️', nom:'30 mm (unité)', ref:'465656', unite:'unité(s)', categorie:'Tiroir Dossiers suspendus', stock:0, seuil:1 }
-]};;let session = { user:null, nom:null };let carts = { papier:{}, fourni:{}, mobilier:{} };let cmdFilters = { papier:'all', fourni:'all', mobilier:'all' };let cmdSearches = { papier:'', fourni:'', mobilier:'' };let activeInvVolet = 'papier';let activeHistVolet = 'papier';let activeDirVolet = 'papier';let invCatFilters = { papier:'all', fourni:'all', mobilier:'all' };let invView = 'grille';let invSearch = '';let invSortKey = 'nom';let invSortDir = 1;let invFilterStat = 'all';let invFilterCat = 'all';const LS = { get:k=>{try{return JSON.parse(localStorage.getItem(k))}catch{return null}}, set:(k,v)=>localStorage.setItem(k,JSON.stringify(v)) };const getOrders = () => LS.get('gf3_orders') || [];const saveOrders = o => LS.set('gf3_orders', o);const getInv = volet => { const _v=LS.get('gf3_inv_'+volet); const arr = (_v && _v.length>0) ? _v : CATALOGUE[volet].map(a=>({...a})); return arr.filter(a => a != null && typeof a === 'object'); };const saveInv = (v,i) => LS.set('gf3_inv_'+v, i);const getHist = () => LS.get('gf3_hist') || [];const saveHist = h => LS.set('gf3_hist', h);const getCounter = () => LS.get('gf3_ctr') || 1;const saveCounter = n => LS.set('gf3_ctr', n);function doLogin() {const u = document.getElementById('l-u').value.trim();const p = document.getElementById('l-p').value;const accounts = getAccounts();if (accounts[u] && accounts[u].hash === p) {session={user:u,nom:accounts[u].nom};LS.set('gf_session',session);document.getElementById('lerr').classList.remove('on');nav('direction');} else {document.getElementById('lerr').classList.add('on');}}
-function doLogout(){session={user:null,nom:null};try{localStorage.removeItem('gf_session');}catch(e){}nav('agent');}
+]};;let session = { user:null, nom:null };let carts = { papier:{}, fourni:{}, mobilier:{} };let cmdFilters = { papier:'all', fourni:'all', mobilier:'all' };let cmdSearches = { papier:'', fourni:'', mobilier:'' };let activeInvVolet = 'papier';let activeHistVolet = 'papier';let activeDirVolet = 'papier';let invCatFilters = { papier:'all', fourni:'all', mobilier:'all' };let invView = 'grille';let invSearch = '';let invSortKey = 'nom';let invSortDir = 1;let invFilterStat = 'all';let invFilterCat = 'all';/* LS remplacé par Firebase - voir initFirebaseData() *//* doLogin() redéfini dans le patch Firebase */
+/* doLogout() redéfini dans le patch Firebase */
 function requireLogin() { session.user ? nav('direction') : nav('login'); }
 function nav(p) {const login = document.getElementById('pg-login');const app = document.getElementById('pg-app');const abar = document.getElementById('agent-volet-bar');const acnav = document.getElementById('agent-cat-nav');if (p === 'login') { login.style.display='block'; app.style.display='none'; return; }
 login.style.display = 'none';app.style.display = 'block';document.querySelectorAll('.view').forEach(v=>v.classList.remove('on'));document.querySelectorAll('.npill').forEach(t=>t.classList.remove('on'));if (p === 'direction') {var _d=document.getElementById('dst-fournitures');if(_d)_d.style.display='';var _cq2=document.getElementById('ip-controle-qualite');if(_cq2){_cq2.style.display='none';_cq2.classList.remove('on');}document.getElementById('view-dir').classList.add('on');abar.style.display = 'none';if (acnav) acnav.style.display = 'none';renderNavUser(); renderStatsMega(); renderAllOrders(); updateInvAlertBadge();updateCourrierBadge(); updateEntretienBadge(); updateFournitureBadge(); updateCustomBadge();setTimeout(()=>{const dashBtn = document.getElementById('itab-dashboard');if (dashBtn) switchDirTab('dashboard', dashBtn);}, 30);} else {document.getElementById('view-agent').classList.add('on');if (acnav) acnav.style.display = 'grid';var _da=document.getElementById('dst-fournitures');if(_da)_da.style.display='none';renderNavUser(); renderAllCatalogues(); updateAgentBadges();const firstCard = document.querySelector('.agent-cat-card');if (firstCard && !firstCard.classList.contains('on')) firstCard.click();}}
@@ -1284,7 +1569,7 @@ el.innerHTML = items.map(a => {return `<div class="crow">
 <button class="cdel" onclick="removeCart('${volet}','${a.id}')">✕</button>
 </div>`;}).join('');}
 function updateAgentBadges() {const orders = getOrders();VOLETS.forEach(v=>{const el = document.getElementById('avb-'+v);if (!el) return;const n = orders.filter(o=>o.volet===v && (o.status==='en_attente' || o.status==='en_attente_restock')).length;el.textContent = n||'';el.style.display = n ? 'inline' : 'none';});}
-const FIELDS = {papier: { nom:'pp-nom', svc:'pp-svc', service:'pp-service', date:'pp-date', prio:'pp-prio', motif:'pp-motif', libre:'pp-libre', site:'pp-site' },fourni: { nom:'pf-nom', svc:'pf-svc', service:'pf-service', date:'pf-date', prio:'pf-prio', motif:'pf-motif', libre:'pf-libre', site:'pf-site' },mobilier: { nom:'pm-nom', svc:'pm-svc', service:'pm-service', date:'pm-date', prio:'pm-prio', motif:'pm-motif', libre:'pm-libre', local:'pm-local', site:'pm-site', adrliv:'pm-adrliv' }};function submitOrder(volet) {const f = FIELDS[volet];const nom = v(f.nom), svc=v(f.svc), date=v(f.date), motif=v(f.motif);const prio = v(f.prio), libre=v(f.libre);const arts = Object.values(carts[volet]);if (!nom) return alert('Veuillez indiquer votre nom.');if (!svc) return alert('Veuillez sélectionner votre service.');if (!date) return alert('Veuillez indiquer une date de livraison.');if (!motif) return alert('Veuillez indiquer un motif.');if (!arts.length && !libre) return alert('Sélectionnez au moins un article ou renseignez une demande libre.');const n = getCounter();const pfx= {papier:'PAP', fourni:'FRN', mobilier:'MOB'}[volet];const id = `${pfx}-${new Date().getFullYear()}-${String(n).padStart(4,'0')}`;saveCounter(n+1);const extra = volet==='mobilier'
+const FIELDS = {papier: { nom:'pp-nom', svc:'pp-svc', service:'pp-service', date:'pp-date', prio:'pp-prio', motif:'pp-motif', libre:'pp-libre', site:'pp-site' },fourni: { nom:'pf-nom', svc:'pf-svc', service:'pf-service', date:'pf-date', prio:'pf-prio', motif:'pf-motif', libre:'pf-libre', site:'pf-site' },mobilier: { nom:'pm-nom', svc:'pm-svc', service:'pm-service', date:'pm-date', prio:'pm-prio', motif:'pm-motif', libre:'pm-libre', local:'pm-local', site:'pm-site', adrliv:'pm-adrliv' }};function submitOrder(volet) {const f = FIELDS[volet];const nom = v(f.nom), svc=v(f.svc), date=v(f.date), motif=v(f.motif);const prio = v(f.prio), libre=v(f.libre);const arts = Object.values(carts[volet]);if (!nom) return alert('Veuillez indiquer votre nom.');if (!svc) return alert('Veuillez sélectionner votre service.');if (!date) return alert('Veuillez indiquer une date de livraison.');if (!motif) return alert('Veuillez indiquer un motif.');if (!arts.length && !libre) return alert('Sélectionnez au moins un article ou renseignez une demande libre.');const n = getCounter();const pfx= {papier:'PAP', fourni:'FRN', mobilier:'MOB'}[volet];const id = `${pfx}-${new Date().getFullYear()}-${String(n).padStart(4,'0')}`;saveCounter(n+1).catch(e=>console.warn(e));const extra = volet==='mobilier'
 ? { local:v(f.local), site:v(f.site), adrliv:v(f.adrliv), service:v(f.service), rqth: document.getElementById('pm-rqth')?.checked || false }
 : { site:v(f.site), service:v(f.service) };const customFields = getFieldsConf()[volet]||[];const extras = customFields
 .filter(cf => cf.custom)
@@ -1292,7 +1577,7 @@ const FIELDS = {papier: { nom:'pp-nom', svc:'pp-svc', service:'pp-service', date
 const inv = getInv(volet);let hasStockIssue = false;const artsWithStock = arts.map(a => {const invArt = inv.find(x=>x.id===a.id);const stockDispo = invArt ? invArt.stock : 999;if (stockDispo <= 0) {hasStockIssue = true;return { ...a, qtyServie:0, prepStatus:'restock', qtyReliquat:a.qty, stockAlert:true };}
 if (a.qty > stockDispo) {hasStockIssue = true;return { ...a, qtyServie:stockDispo, prepStatus:'restock', qtyReliquat:a.qty - stockDispo, stockAlert:true };}
 return { ...a, stockAlert:false };});const artsEnAlerte = artsWithStock.filter(a=>a.stockAlert);if (artsEnAlerte.length) {showStockNotif(artsEnAlerte.map(a=>({ nom:a.nom, stock:inv.find(x=>x.id===a.id)?.stock||0, seuil:inv.find(x=>x.id===a.id)?.seuil||0, qty:a.qty })));}
-const orders = getOrders();orders.unshift({id, volet, agent:nom, service_dir:svc, service_unit:v(f.service),datelivraison:date, priorite:prio, motif, articles:artsWithStock, libre,status:'en_attente',hasStockAlert: hasStockIssue,datesoumission:now(), comment:'', traitePar:'', dateTraitement:'', extras,...extra});saveOrders(orders);[f.nom,f.svc,f.service,f.motif,f.libre,f.site,...(volet==='mobilier'?[f.local,f.adrliv]:[])]
+const orders = getOrders();orders.unshift({id, volet, agent:nom, service_dir:svc, service_unit:v(f.service),datelivraison:date, priorite:prio, motif, articles:artsWithStock, libre,status:'en_attente',hasStockAlert: hasStockIssue,datesoumission:now(), comment:'', traitePar:'', dateTraitement:'', extras,...extra});saveOrders(orders).catch(e=>console.warn(e));[f.nom,f.svc,f.service,f.motif,f.libre,f.site,...(volet==='mobilier'?[f.local,f.adrliv]:[])]
 .filter(Boolean).forEach(id=>{const el=document.getElementById(id);if(el)el.value='';});if (volet==='mobilier') { const rqth=document.getElementById('pm-rqth'); if(rqth) rqth.checked=false; };(getFieldsConf()[volet]||[]).filter(cf=>cf.custom).forEach(cf=>{const el=document.getElementById('cx-'+volet+'-'+cf.key); if(el) el.value='';});;carts[volet] = {};renderCatalogue(volet);renderCart(volet);updateBadgeTotal();updateAgentBadges();if (hasStockIssue) {toast(`✅ Commande ${id} envoyée ⚠️ Certains articles dépassent le stock disponible — ils seront gérés en reliquat.`);} else {toast(`✅ Commande ${id} envoyée à la direction !`);}}
 const v = id => { const el=document.getElementById(id); return el ? el.value.trim() : ''; };function renderStatsMega() {const orders = getOrders();const att = orders.filter(o=>o.status==='en_attente').length;const today = new Date().toLocaleDateString('fr-FR', {weekday:'long', day:'numeric', month:'long', year:'numeric'});const attLbl = att>0 ? ` · <strong style="color:var(--orange)">${att} demande${att>1?'s':''} en attente</strong>` : ' · <span style="color:var(--green)">✓ Aucune demande en attente</span>';document.getElementById('dir-sub').innerHTML = `${today}${attLbl} · Connecté : <strong>${session.nom}</strong>`;updateBadgeTotal();updateInvAlertBadge();updateFournitureBadge();updateEntretienBadge();updateCourrierBadge();let critArts=0; VOLETS.forEach(v=>{ getInv(v).forEach(a=>{ if(a.stock<=0) critArts++; }); });const dashBadge=document.getElementById('dash-alert-badge');if(dashBadge){dashBadge.textContent=critArts||'';dashBadge.style.display=critArts>0?'inline':'none';}}
 function updateBadgeTotal() {const n = getOrders().filter(o=>o.status==='en_attente').length;const el = document.getElementById('nb-total');if (el) { el.textContent = n; el.style.display = n>0 ? 'inline' : 'none'; }
@@ -1398,9 +1683,9 @@ ${act}
 </div>`;}
 function toggleCard(id) { document.getElementById('card-'+id)?.classList.toggle('open'); }
 function processOrder(id, status='prevalide') {const cmt = document.getElementById('cmt-'+id)?.value.trim()||'';if (status==='refusee' && !cmt) { alert('Un commentaire est obligatoire en cas de refus.'); return; }
-const orders = getOrders();const order = orders.find(o=>o.id===id);if (!order) return;if (status==='prevalide') {order.status = 'prevalide';order.comment = cmt;order.prevalideePar = session.nom;order.datePrevalidation= now();saveOrders(orders);toast('🗂️ Commande prévalidée — disponible dans Préparation');renderStatsMega(); renderOrders(order.volet); updateDirVoletCounts(); updatePrepBadge();setTimeout(()=>document.getElementById('card-'+id)?.classList.add('open'),60);return;}
-if (status==='refusee') {order.status = 'refusee';order.comment = cmt;order.traitePar = session.nom;order.dateTraitement = now();saveOrders(orders);toast('❌ Commande refusée');renderStatsMega(); renderOrders(order.volet); updateDirVoletCounts(); updatePrepBadge();setTimeout(()=>document.getElementById('card-'+id)?.classList.add('open'),60);return;}
-order.status = status;order.comment = cmt;order.traitePar = session.nom;order.dateTraitement = now();saveOrders(orders);if (status==='validee') {const inv = getInv(order.volet);const hist = getHist();(order.articles||[]).forEach(art=>{if (art.prepStatus === 'refuse') return;const qty = art.qtyServie !== undefined ? art.qtyServie : art.qty;if (!qty || qty <= 0) return;const a = inv.find(x=>x.id===art.id);if (a) {const avant = a.stock;a.stock = Math.max(0, a.stock - qty);hist.unshift({ date:now(), type:'sortie', volet:order.volet, article:art.nom, ref:art.ref, icone:art.icone||'📦', unite:art.unite, qty, cmdId:id, agent:order.agent, note:`Commande validée — ${order.service_dir||order.service}`, stockAvant:avant, stockApres:a.stock });}});saveInv(order.volet, inv);hist.splice(500); saveHist(hist);updateInvAlertBadge();renderCatalogue(order.volet);}
+const orders = getOrders();const order = orders.find(o=>o.id===id);if (!order) return;if (status==='prevalide') {order.status = 'prevalide';order.comment = cmt;order.prevalideePar = session.nom;order.datePrevalidation= now();saveOrders(orders).catch(e=>console.warn(e));toast('🗂️ Commande prévalidée — disponible dans Préparation');renderStatsMega(); renderOrders(order.volet); updateDirVoletCounts(); updatePrepBadge();setTimeout(()=>document.getElementById('card-'+id)?.classList.add('open'),60);return;}
+if (status==='refusee') {order.status = 'refusee';order.comment = cmt;order.traitePar = session.nom;order.dateTraitement = now();saveOrders(orders).catch(e=>console.warn(e));toast('❌ Commande refusée');renderStatsMega(); renderOrders(order.volet); updateDirVoletCounts(); updatePrepBadge();setTimeout(()=>document.getElementById('card-'+id)?.classList.add('open'),60);return;}
+order.status = status;order.comment = cmt;order.traitePar = session.nom;order.dateTraitement = now();saveOrders(orders).catch(e=>console.warn(e));if (status==='validee') {const inv = getInv(order.volet);const hist = getHist();(order.articles||[]).forEach(art=>{if (art.prepStatus === 'refuse') return;const qty = art.qtyServie !== undefined ? art.qtyServie : art.qty;if (!qty || qty <= 0) return;const a = inv.find(x=>x.id===art.id);if (a) {const avant = a.stock;a.stock = Math.max(0, a.stock - qty);hist.unshift({ date:now(), type:'sortie', volet:order.volet, article:art.nom, ref:art.ref, icone:art.icone||'📦', unite:art.unite, qty, cmdId:id, agent:order.agent, note:`Commande validée — ${order.service_dir||order.service}`, stockAvant:avant, stockApres:a.stock });}});saveInv(order.volet, inv).catch(e=>console.warn(e));hist.splice(500); saveHist(hist).catch(e=>console.warn(e));updateInvAlertBadge();renderCatalogue(order.volet);}
 toast(status==='validee'?'✅ Commande finalisée — stock déduit':status==='en_attente_restock'?'📦 Commande partiellement traitée — reliquat en attente':'❌ Commande refusée');renderStatsMega(); renderAllOrders(); updateDirVoletCounts(); updatePrepBadge();}
 function archiveOrder(id) {
   const orders = getOrders();
@@ -1511,7 +1796,7 @@ const hasRestock = arts.some(a => a.prepStatus === 'restock');const hasServi = a
 if (hasRestock && !hasServi) {processOrderFinale(orderId, 'en_attente_restock', cmt);return;}
 if (hasRestock) {processOrderFinale(orderId, 'en_attente_restock', cmt);return;}
 processOrderFinale(orderId, 'validee', cmt);}
-function processOrderFinale(id, status, cmt) {const orders = getOrders();const order = orders.find(o=>o.id===id);if (!order) return;order.comment = cmt;order.traitePar = session.nom;order.dateTraitement = now();order.status = status;saveOrders(orders);if (status === 'validee' || status === 'en_attente_restock') {const inv = getInv(order.volet);const hist = getHist();(order.articles||[]).forEach(art=>{if (art.prepStatus !== 'servi') return;const qty = art.qtyServie !== undefined ? art.qtyServie : art.qty;if (!qty || qty <= 0) return;const a = inv.find(x=>x.id===art.id);if (a) {const avant = a.stock;a.stock = Math.max(0, a.stock - qty);hist.unshift({ date:now(), type:'sortie', volet:order.volet, article:art.nom, ref:art.ref, icone:art.icone||'📦', unite:art.unite, qty, cmdId:id, agent:order.agent, note:`Commande ${status==='validee'?'validée':'partielle'} — ${order.service_dir||order.service}`, stockAvant:avant, stockApres:a.stock });}});saveInv(order.volet, inv);hist.splice(500); saveHist(hist);updateInvAlertBadge();renderCatalogue(order.volet);}
+function processOrderFinale(id, status, cmt) {const orders = getOrders();const order = orders.find(o=>o.id===id);if (!order) return;order.comment = cmt;order.traitePar = session.nom;order.dateTraitement = now();order.status = status;saveOrders(orders).catch(e=>console.warn(e));if (status === 'validee' || status === 'en_attente_restock') {const inv = getInv(order.volet);const hist = getHist();(order.articles||[]).forEach(art=>{if (art.prepStatus !== 'servi') return;const qty = art.qtyServie !== undefined ? art.qtyServie : art.qty;if (!qty || qty <= 0) return;const a = inv.find(x=>x.id===art.id);if (a) {const avant = a.stock;a.stock = Math.max(0, a.stock - qty);hist.unshift({ date:now(), type:'sortie', volet:order.volet, article:art.nom, ref:art.ref, icone:art.icone||'📦', unite:art.unite, qty, cmdId:id, agent:order.agent, note:`Commande ${status==='validee'?'validée':'partielle'} — ${order.service_dir||order.service}`, stockAvant:avant, stockApres:a.stock });}});saveInv(order.volet, inv).catch(e=>console.warn(e));hist.splice(500); saveHist(hist).catch(e=>console.warn(e));updateInvAlertBadge();renderCatalogue(order.volet);}
 const msg = status==='validee' ? '✅ Commande finalisée — stock déduit'
 : status==='en_attente_restock' ? '🔄 Commande partiellement traitée — articles en restock conservés'
 : '❌ Commande refusée';toast(msg);renderStatsMega(); renderAllOrders(); updateDirVoletCounts(); updatePrepBadge();renderPreparation();}
@@ -1664,9 +1949,9 @@ ${filtered.map((a,i)=>{const max = Math.max(a.seuil*4, a.stock, 1);const pct = M
 function setInvCatFilter(volet, cat, btn) {invFilterCat = cat;const sel = document.getElementById('inv-filter-cat');if (sel) sel.value = cat;renderInventaireVolet(volet);}
 function invSort(key) {if (invSortKey===key) invSortDir *= -1;else { invSortKey=key; invSortDir=1; }
 renderInventaireVolet(activeInvVolet);}
-function quickAdj(volet, id, sign) {const qEl = document.getElementById(`qadj-${volet}-${id}`);const qty = parseInt(qEl?.value)||1;if (qty<=0) return;const inv = getInv(volet);const hist = getHist();const a = inv.find(x=>x.id===id);if (!a) return;const avant = a.stock;a.stock = Math.max(0, a.stock + sign*qty);saveInv(volet, inv);hist.unshift({ date:now(), type:sign>0?'entree':'sortie', volet, article:a.nom, ref:a.ref, icone:a.icone, unite:a.unite, qty, cmdId:'', agent:session.nom||'—', note:sign>0?'Entrée manuelle rapide':'Sortie manuelle rapide', stockAvant:avant, stockApres:a.stock });hist.splice(500); saveHist(hist);toast((sign>0?`✅ +${qty}`:`📤 −${qty}`) + ` sur "${a.nom}"`);renderInventaireVolet(volet);renderInvStatStrip();renderStatsMega();renderCatalogue(volet);}
+function quickAdj(volet, id, sign) {const qEl = document.getElementById(`qadj-${volet}-${id}`);const qty = parseInt(qEl?.value)||1;if (qty<=0) return;const inv = getInv(volet);const hist = getHist();const a = inv.find(x=>x.id===id);if (!a) return;const avant = a.stock;a.stock = Math.max(0, a.stock + sign*qty);saveInv(volet, inv).catch(e=>console.warn(e));hist.unshift({ date:now(), type:sign>0?'entree':'sortie', volet, article:a.nom, ref:a.ref, icone:a.icone, unite:a.unite, qty, cmdId:'', agent:session.nom||'—', note:sign>0?'Entrée manuelle rapide':'Sortie manuelle rapide', stockAvant:avant, stockApres:a.stock });hist.splice(500); saveHist(hist);toast((sign>0?`✅ +${qty}`:`📤 −${qty}`) + ` sur "${a.nom}"`);renderInventaireVolet(volet);renderInvStatStrip();renderStatsMega();renderCatalogue(volet);}
 function saveSeuil(volet, id) {const inp = document.getElementById(`seuil-${volet}-${id}`);const val = parseInt(inp?.value);if (isNaN(val)||val<0) { toast('⚠️ Seuil invalide',true); return; }
-const inv = getInv(volet);const a = inv.find(x=>x.id===id);if (!a) return;a.seuil = val;saveInv(volet, inv);toast(`✅ Seuil de "${a.nom}" mis à jour → ${val}`);renderInventaireVolet(volet);renderInvStatStrip();updateInvAlertBadge();}
+const inv = getInv(volet);const a = inv.find(x=>x.id===id);if (!a) return;a.seuil = val;saveInv(volet, inv).catch(e=>console.warn(e));toast(`✅ Seuil de "${a.nom}" mis à jour → ${val}`);renderInventaireVolet(volet);renderInvStatStrip();updateInvAlertBadge();}
 function renderHistorique() {let hist = getHist();if (activeHistVolet!=='all') hist = hist.filter(h=>h.volet===activeHistVolet);const typeSel = document.getElementById('hist-type-sel');const type = typeSel?.value||'all';if (type!=='all') hist = hist.filter(h=>h.type===type);const dateFrom = document.getElementById('hist-date-from')?.value;const dateTo = document.getElementById('hist-date-to')?.value;if (dateFrom) hist = hist.filter(h=>{ const d=parseDateFR(h.date); return d&&d>=new Date(dateFrom); });if (dateTo) hist = hist.filter(h=>{ const d=parseDateFR(h.date); return d&&d<=new Date(dateTo+'T23:59:59'); });const totalEntrees = hist.filter(h=>h.type==='entree').reduce((s,h)=>s+h.qty,0);const totalSorties = hist.filter(h=>h.type==='sortie').reduce((s,h)=>s+h.qty,0);const nbMvts = hist.length;const articlesDistincts = new Set(hist.map(h=>h.article)).size;const strip = document.getElementById('hist-stats-strip');if (strip) strip.innerHTML=`
 <div class="hss-item"><div class="hss-val">${nbMvts}</div><div class="hss-lbl">Mouvements filtrés</div></div>
 <div class="hss-item"><div class="hss-val" style="color:var(--green)">+${totalEntrees}</div><div class="hss-lbl">📥 Total entrées</div></div>
@@ -1771,7 +2056,7 @@ function filterEmoji(id, q) {const grid = document.getElementById('epg-'+id);if 
 function filterEmojiCat(id, cat, btn) {if (!emojiPickerState[id]) emojiPickerState[id]={};emojiPickerState[id].cat = cat;btn.closest('.emoji-cats').querySelectorAll('.emoji-cat-btn').forEach(b=>b.classList.remove('on'));btn.classList.add('on');const grid = document.getElementById('epg-'+id);if (!grid) return;const pool = cat==='all' ? EMOJI_ALL : (EMOJI_CATS[cat]||EMOJI_ALL);grid.innerHTML = pool.map(e=>`<button class="emoji-btn" onclick="selectEmoji('${id}','${e}')">${e}</button>`).join('');}
 function selectEmoji(id, emoji) {const val = document.getElementById('epv-'+id);if (val) val.textContent = emoji;let hidden = document.getElementById('epi-'+id);if (!hidden) { hidden = document.createElement('input'); hidden.type='hidden'; hidden.id='epi-'+id; document.getElementById('epw-'+id)?.appendChild(hidden); }
 hidden.value = emoji;const epd=document.getElementById('epd-'+id);if(epd){epd.classList.remove('open');epd.style.display='none';}}
-const getEntretien = () => LS.get('gf4_entretien') || [];const saveEntretien = e => LS.set('gf4_entretien', e);let entretienPhotos = [];let entretienFilter = 'all';function handlePhotoSelect(input) {Array.from(input.files).forEach(f=>readPhoto(f));input.value='';}
+/* getEntretien/saveEntretien définis dans Firebase patch */let entretienPhotos = [];let entretienFilter = 'all';function handlePhotoSelect(input) {Array.from(input.files).forEach(f=>readPhoto(f));input.value='';}
 function handlePhotoDrop(e) {e.preventDefault();document.getElementById('pe-photos-zone')?.classList.remove('drag');Array.from(e.dataTransfer.files).filter(f=>f.type.startsWith('image/')).forEach(f=>readPhoto(f));}
 function readPhoto(file) {if (file.size > 5*1024*1024) { toast('⚠️ Fichier trop lourd (max 5 Mo) : '+file.name, true); return; }
 const r = new FileReader();r.onload = e => {entretienPhotos.push({ name:file.name, dataUrl:e.target.result });renderPhotoPreviews();};r.readAsDataURL(file);}
@@ -1781,7 +2066,7 @@ function renderPhotoPreviews() {const el = document.getElementById('pe-preview')
 <button class="photo-thumb-del" onclick="removePhoto(${i})">✕</button>
 </div>`).join('');}
 function removePhoto(i) { entretienPhotos.splice(i,1); renderPhotoPreviews(); }
-function submitEntretien() {const g = id => document.getElementById(id)?.value?.trim()||'';const contact = g('pe-contact'), svc=g('pe-svc'), service=g('pe-service'), lieu=g('pe-lieu');const salle=g('pe-salle'), date=g('pe-date'), heure=g('pe-heure'), desc=g('pe-description');if (!contact) return alert('Veuillez indiquer le contact.');if (!lieu) return alert('Veuillez indiquer le lieu.');if (!salle) return alert('Veuillez indiquer la salle.');if (!date) return alert('Veuillez indiquer la date.');if (!heure) return alert('Veuillez indiquer l\'heure.');if (!desc) return alert('Veuillez décrire le défaut constaté.');const list = getEntretien();const n = (LS.get('gf4_ectr')||1);LS.set('gf4_ectr', n+1);const id = `ENT-${new Date().getFullYear()}-${String(n).padStart(4,'0')}`;list.unshift({ id, contact, service:svc, service_unit:service, lieu, salle, date, heure, description:desc, photos:entretienPhotos.map(p=>({name:p.name,dataUrl:p.dataUrl})), statut:'nouveau', datesoumission:now(), commentaire:'' });saveEntretien(list);['pe-contact','pe-svc','pe-service','pe-lieu','pe-salle','pe-date','pe-heure','pe-description'].forEach(id=>{ const el=document.getElementById(id); if(el) el.value=''; });entretienPhotos=[];renderPhotoPreviews();toast(`✅ Signalement ${id} envoyé !`);}
+function submitEntretien() {const g = id => document.getElementById(id)?.value?.trim()||'';const contact = g('pe-contact'), svc=g('pe-svc'), service=g('pe-service'), lieu=g('pe-lieu');const salle=g('pe-salle'), date=g('pe-date'), heure=g('pe-heure'), desc=g('pe-description');if (!contact) return alert('Veuillez indiquer le contact.');if (!lieu) return alert('Veuillez indiquer le lieu.');if (!salle) return alert('Veuillez indiquer la salle.');if (!date) return alert('Veuillez indiquer la date.');if (!heure) return alert('Veuillez indiquer l\'heure.');if (!desc) return alert('Veuillez décrire le défaut constaté.');const list = getEntretien();const n = ((_cache['gf4_ectr']||1)||1);(_cache['gf4_ectr']= n+1);const id = `ENT-${new Date().getFullYear()}-${String(n).padStart(4,'0')}`;list.unshift({ id, contact, service:svc, service_unit:service, lieu, salle, date, heure, description:desc, photos:entretienPhotos.map(p=>({name:p.name,dataUrl:p.dataUrl})), statut:'nouveau', datesoumission:now(), commentaire:'' });saveEntretien(list).catch(e=>console.warn(e));['pe-contact','pe-svc','pe-service','pe-lieu','pe-salle','pe-date','pe-heure','pe-description'].forEach(id=>{ const el=document.getElementById(id); if(el) el.value=''; });entretienPhotos=[];renderPhotoPreviews();toast(`✅ Signalement ${id} envoyé !`);}
 function renderEntretienDir() {let list = getEntretien();const all=list.length, nv=list.filter(e=>e.statut==='nouveau').length, ec=list.filter(e=>e.statut==='en_cours').length, tr=list.filter(e=>e.statut==='traite').length;document.getElementById('efc-all').textContent=all;document.getElementById('efc-nouveau').textContent=nv;document.getElementById('efc-encours').textContent=ec;document.getElementById('efc-traite').textContent=tr;if (entretienFilter!=='all') list=list.filter(e=>e.statut===entretienFilter);const el=document.getElementById('ol-entretien');if (!list.length){el.innerHTML=`<div class="ocard"><div class="empty"><div class="empty-ico">🧹</div><h3>Aucun signalement</h3><p>Aucun défaut d'entretien signalé pour l'instant.</p></div></div>`;return;}
 el.innerHTML=list.map((e,i)=>`
 <div class="ecard ${e.statut}" id="ecard-${e.id}" style="animation-delay:${i*.03}s">
@@ -1882,8 +2167,8 @@ function renderComptes() {const accounts = getAccounts();const el = document.get
 </div>
 </div>`;}
 function checkPwdStrength(input, barId) {const v=input.value, bar=document.getElementById(barId);if(!bar) return;const score = [/.{8,}/, /[A-Z]/, /[0-9]/, /[^A-Za-z0-9]/].filter(r=>r.test(v)).length;const colors=['#E6007E','#EC6608','#009FE3','#3FA535'];const widths=['25%','50%','75%','100%'];bar.style.width = v.length ? widths[score-1]||'10%' : '0';bar.style.background = v.length ? colors[score-1]||'var(--red)' : 'transparent';}
-function createCompte() {const g = id => document.getElementById(id)?.value?.trim()||'';const login=g('nc-login'), nom=g('nc-nom'), svc=g('nc-svc'), role=g('nc-role');const pwd=document.getElementById('nc-pwd')?.value||'';const pwd2=document.getElementById('nc-pwd2')?.value||'';if (!login) return alert('L\'identifiant est obligatoire.');if (!nom) return alert('Le nom complet est obligatoire.');if (!pwd) return alert('Le mot de passe est obligatoire.');if (pwd.length < 8) return alert('Le mot de passe doit contenir au moins 8 caractères.');if (pwd !== pwd2) return alert('Les mots de passe ne correspondent pas.');const accounts = getAccounts();if (accounts[login]) return alert(`L'identifiant "${login}" existe déjà.`);accounts[login] = { hash:pwd, nom, service:svc, role };saveAccounts(accounts);toast(`✅ Compte "${login}" créé`);renderComptes();}
-function deleteCompte(login) {const accounts = getAccounts();if (Object.keys(accounts).length <= 1) return alert('Impossible de supprimer le dernier compte.');if (!confirm(`Supprimer le compte "${login}" ?`)) return;delete accounts[login];saveAccounts(accounts);toast(`🗑 Compte "${login}" supprimé`);renderComptes();}
+function createCompte() {const g = id => document.getElementById(id)?.value?.trim()||'';const login=g('nc-login'), nom=g('nc-nom'), svc=g('nc-svc'), role=g('nc-role');const pwd=document.getElementById('nc-pwd')?.value||'';const pwd2=document.getElementById('nc-pwd2')?.value||'';if (!login) return alert('L\'identifiant est obligatoire.');if (!nom) return alert('Le nom complet est obligatoire.');if (!pwd) return alert('Le mot de passe est obligatoire.');if (pwd.length < 8) return alert('Le mot de passe doit contenir au moins 8 caractères.');if (pwd !== pwd2) return alert('Les mots de passe ne correspondent pas.');const accounts = getAccounts();if (accounts[login]) return alert(`L'identifiant "${login}" existe déjà.`);accounts[login] = { hash:pwd, nom, service:svc, role };saveAccounts(accounts).catch(e=>console.warn(e));toast(`✅ Compte "${login}" créé`);renderComptes();}
+function deleteCompte(login) {const accounts = getAccounts();if (Object.keys(accounts).length <= 1) return alert('Impossible de supprimer le dernier compte.');if (!confirm(`Supprimer le compte "${login}" ?`)) return;delete accounts[login];saveAccounts(accounts).catch(e=>console.warn(e));toast(`🗑 Compte "${login}" supprimé`);renderComptes();}
 function openEditCompte(login) {const accounts = getAccounts();const a = accounts[login];if (!a) return;const modal = document.getElementById('edit-article-modal');modal.innerHTML = `
 <div class="modal">
 <div class="modal-head"><h3>✏️ Modifier le compte — ${login}</h3><button class="modal-close" onclick="closeEditModal()">✕</button></div>
@@ -1910,7 +2195,7 @@ function openEditCompte(login) {const accounts = getAccounts();const a = account
 <button class="badd-item" onclick="saveEditCompte('${login}')">💾 Enregistrer</button>
 </div>
 </div>`;modal.classList.add('on');}
-function saveEditCompte(login) {const g = id => document.getElementById(id)?.value?.trim()||'';const nom=g('ec-nom'), svc=g('ec-svc'), role=g('ec-role');const pwd=document.getElementById('ec-pwd')?.value||'';const pwd2=document.getElementById('ec-pwd2')?.value||'';if (pwd && pwd.length<8) return alert('Mot de passe trop court (min. 8 caractères).');if (pwd && pwd!==pwd2) return alert('Les mots de passe ne correspondent pas.');const accounts=getAccounts();accounts[login].nom=nom; accounts[login].service=svc; accounts[login].role=role;if (pwd) accounts[login].hash=pwd;saveAccounts(accounts);closeEditModal();toast(`✅ Compte "${login}" mis à jour`);renderComptes();}
+function saveEditCompte(login) {const g = id => document.getElementById(id)?.value?.trim()||'';const nom=g('ec-nom'), svc=g('ec-svc'), role=g('ec-role');const pwd=document.getElementById('ec-pwd')?.value||'';const pwd2=document.getElementById('ec-pwd2')?.value||'';if (pwd && pwd.length<8) return alert('Mot de passe trop court (min. 8 caractères).');if (pwd && pwd!==pwd2) return alert('Les mots de passe ne correspondent pas.');const accounts=getAccounts();accounts[login].nom=nom; accounts[login].service=svc; accounts[login].role=role;if (pwd) accounts[login].hash=pwd;saveAccounts(accounts).catch(e=>console.warn(e));closeEditModal();toast(`✅ Compte "${login}" mis à jour`);renderComptes();}
 function getEmojiVal(id) {const hidden = document.getElementById('epi-'+id);if (hidden?.value) return hidden.value;return document.getElementById('epv-'+id)?.textContent||'📦';}
 document.addEventListener('click', e=>{if (!e.target.closest('.emoji-wrap')) {document.querySelectorAll('.emoji-dropdown.open').forEach(el=>{el.classList.remove('open');el.style.display='none';});}});function switchArticlesVolet(v, btn) {activeArticlesVolet = v;document.querySelectorAll('#ip-articles .pvt').forEach(b=>b.classList.remove('on'));btn.classList.add('on');['papier','fourni','mobilier'].forEach(x=>{ document.getElementById('art-'+x).style.display = x===v?'block':'none'; });renderArticlesPanel(v);}
 function renderArticlesPanel(volet) {const inv = getInv(volet);const el = document.getElementById('art-'+volet);if (!el) return;const cats = getAllCats(volet);const clr = `var(--c-${volet})`;const clrL = `var(--cl-${volet})`;el.innerHTML = `
@@ -1972,7 +2257,7 @@ const reader = new FileReader();reader.onload = function(e) {try {const wb = XLS
 saveInv(volet, getInv(volet).map(a=>{if((a.id===id||a.ref===ref)){return {...a,nom,ref:ref||a.ref,icone,unite,categorie:cat,stock,seuil};}
 return a;}));imported++;});input.value='';renderArticlesPanel(volet);renderCatalogue(volet);updateInvAlertBadge();toast(`✅ Import Excel : ${imported} article(s) mis à jour`);} catch(err) {console.error(err);toast('❌ Erreur lors de l\'import Excel', true);}};reader.readAsArrayBuffer(file);}
 function openEditArticle(volet, id) {
-  let inv = LS.get('gf3_inv_'+volet);
+  let inv = getInv(volet);
   if (!inv || inv.length===0) inv = CATALOGUE[volet].map(a=>Object.assign({},a));
   const a = inv.find(x=>x.id===id); if (!a) return;
   const cats = getAllCats(volet);
@@ -2007,22 +2292,22 @@ ${cats.map(c=>`<option value="${c.replace(/"/g,'&quot;')}" ${c===(a.categorie||'
 </div>
 </div>`;modal.classList.add('on');}
 function closeEditModal() {document.getElementById('edit-article-modal').classList.remove('on');}
-function saveEditArticle(volet, id) {const g = sid => document.getElementById(sid)?.value?.trim()||'';const nom = g('ea-nom');const ref = g('ea-ref');const ico = getEmojiVal('ea-ico');const unite = g('ea-unit');const catSel = g('ea-cat'); const cat = (catSel === '__other__' || catSel === '') ? (g('ea-cat-other') || 'Divers') : (catSel || 'Divers');const stock = parseInt(g('ea-stock'))||0;const seuil = parseInt(g('ea-seuil'))||1;if (!nom) return alert('Le nom est obligatoire.');let inv = LS.get('gf3_inv_'+volet);
+function saveEditArticle(volet, id) {const g = sid => document.getElementById(sid)?.value?.trim()||'';const nom = g('ea-nom');const ref = g('ea-ref');const ico = getEmojiVal('ea-ico');const unite = g('ea-unit');const catSel = g('ea-cat'); const cat = (catSel === '__other__' || catSel === '') ? (g('ea-cat-other') || 'Divers') : (catSel || 'Divers');const stock = parseInt(g('ea-stock'))||0;const seuil = parseInt(g('ea-seuil'))||1;if (!nom) return alert('Le nom est obligatoire.');let inv = getInv(volet);
   if (!inv || inv.length===0) inv = CATALOGUE[volet].map(a=>Object.assign({},a));const a = inv.find(x=>x.id===id);if (!a) return;addUserCat(cat);
 Object.assign(a, { nom, ref, icone:ico, unite, categorie:cat, stock, seuil });saveInv(volet, inv);closeEditModal();toast(`✅ "${nom}" mis à jour`);renderArticlesPanel(volet);renderCatalogue(volet);updateInvAlertBadge();}
-function deleteArticle(volet, id) {let inv = LS.get('gf3_inv_'+volet);
-  if (!inv||inv.length===0) inv = CATALOGUE[volet].map(a=>Object.assign({},a));const art = inv.find(a=>a.id===id);if (!art) return;if (!confirm(`Supprimer "${art.nom}" du catalogue ${volet} ?`)) return;saveInv(volet, inv.filter(a=>a.id!==id));toast(`🗑 "${art.nom}" supprimé`);renderArticlesPanel(volet);renderCatalogue(volet);updateInvAlertBadge();}
+function deleteArticle(volet, id) {let inv = getInv(volet);
+  if (!inv||inv.length===0) inv = CATALOGUE[volet].map(a=>Object.assign({},a));const art = inv.find(a=>a.id===id);if (!art) return;if (!confirm(`Supprimer "${art.nom}" du catalogue ${volet} ?`)) return;saveInv(volet, inv.filter(a=>a.id!==id)).catch(e=>console.warn(e));toast(`🗑 "${art.nom}" supprimé`);renderArticlesPanel(volet);renderCatalogue(volet);updateInvAlertBadge();}
 function addArticle(volet) {const g = s => document.getElementById(s)?.value?.trim()||'';const nom = g(`na-nom-${volet}`);const ref = g(`na-ref-${volet}`);const ico = getEmojiVal('na-ico-'+volet);const unit = g(`na-unit-${volet}`) || 'unité(s)';const catSelA = g(`na-cat-${volet}`); const cat = (catSelA === '__other__' || catSelA === '') ? (g(`na-cat-other-${volet}`) || 'Divers') : (catSelA || 'Divers');const stock = parseInt(g(`na-stock-${volet}`))||0;const seuil = parseInt(g(`na-seuil-${volet}`))||1;if (!nom) return alert('Le nom est obligatoire.');if (!ref) return alert('La référence est obligatoire.');// Lire depuis LS ou initialiser depuis CATALOGUE si vide
-let inv = LS.get('gf3_inv_'+volet);
+let inv = getInv(volet);
 if (!inv || inv.length===0) inv = CATALOGUE[volet].map(a=>Object.assign({},a));
 if (inv.find(a=>a.ref===ref||a.id===ref.toLowerCase().replace(/[^a-z0-9]/g,'-'))) return alert(`La référence "${ref}" existe déjà.`);
 const id = ref.toLowerCase().replace(/[^a-z0-9]/g,'-');
 inv.push({ id, icone:ico, nom, ref, unite:unit, categorie:cat, stock, seuil });
-saveInv(volet, inv);toast(`✅ "${nom}" ajouté au catalogue`);renderArticlesPanel(volet);renderCatalogue(volet);updateInvAlertBadge();}
-const getCourriers = () => LS.get('gf4_courrier') || [];const saveCourriers = c => LS.set('gf4_courrier', c);let courrierFilter = 'all';function checkNombreCourrier(input) {const n = parseInt(input.value)||0;const el = document.getElementById('pc-nb-hint');if (!el) return;if (!input.value) { el.textContent=''; el.className='courrier-nb-hint'; return; }
+saveInv(volet, inv).catch(e=>console.warn(e));toast(`✅ "${nom}" ajouté au catalogue`);renderArticlesPanel(volet);renderCatalogue(volet);updateInvAlertBadge();}
+/* getCourriers/saveCourriers définis dans Firebase patch */let courrierFilter = 'all';function checkNombreCourrier(input) {const n = parseInt(input.value)||0;const el = document.getElementById('pc-nb-hint');if (!el) return;if (!input.value) { el.textContent=''; el.className='courrier-nb-hint'; return; }
 if (n < 200) { el.textContent=`⚠️ Minimum 200 courriers requis (vous avez saisi ${n})`; el.className='courrier-nb-hint err'; }
 else { el.textContent=`✅ ${n} courriers — envoi en nombre valide`; el.className='courrier-nb-hint ok'; }}
-function submitCourrier() {const g = id => document.getElementById(id)?.value?.trim()||'';const nom = g('pc-nom');const dir = g('pc-dir');const service = g('pc-service');const contact = g('pc-contact');const date = g('pc-date');const nombre = parseInt(g('pc-nombre'))||0;const motif = g('pc-motif');const compl = g('pc-complement');if (!nom) return alert('Veuillez indiquer votre nom et prénom.');if (!dir) return alert('Veuillez sélectionner votre direction.');if (!date) return alert('Veuillez indiquer la date souhaitée d\'envoi.');if (!nombre) return alert('Veuillez indiquer le nombre de courriers.');if (nombre < 200) return alert(`Le nombre minimum pour un envoi en nombre est de 200 courriers. Vous avez saisi ${nombre}.`);if (!motif) return alert('Veuillez indiquer le motif de l\'envoi.');const list = getCourriers();const n = LS.get('gf4_cctr')||1;LS.set('gf4_cctr', n+1);const id = `ENV-${new Date().getFullYear()}-${String(n).padStart(4,'0')}`;list.unshift({ id, nom, direction:dir, service, contact, date, nombre, motif, complement:compl, statut:'en_attente', datesoumission:now(), commentaire:'' });saveCourriers(list);['pc-nom','pc-dir','pc-service','pc-contact','pc-date','pc-nombre','pc-motif','pc-complement']
+function submitCourrier() {const g = id => document.getElementById(id)?.value?.trim()||'';const nom = g('pc-nom');const dir = g('pc-dir');const service = g('pc-service');const contact = g('pc-contact');const date = g('pc-date');const nombre = parseInt(g('pc-nombre'))||0;const motif = g('pc-motif');const compl = g('pc-complement');if (!nom) return alert('Veuillez indiquer votre nom et prénom.');if (!dir) return alert('Veuillez sélectionner votre direction.');if (!date) return alert('Veuillez indiquer la date souhaitée d\'envoi.');if (!nombre) return alert('Veuillez indiquer le nombre de courriers.');if (nombre < 200) return alert(`Le nombre minimum pour un envoi en nombre est de 200 courriers. Vous avez saisi ${nombre}.`);if (!motif) return alert('Veuillez indiquer le motif de l\'envoi.');const list = getCourriers();const n = (_cache['gf4_cctr']||1)||1;(_cache['gf4_cctr']= n+1);const id = `ENV-${new Date().getFullYear()}-${String(n).padStart(4,'0')}`;list.unshift({ id, nom, direction:dir, service, contact, date, nombre, motif, complement:compl, statut:'en_attente', datesoumission:now(), commentaire:'' });saveCourriers(list).catch(e=>console.warn(e));['pc-nom','pc-dir','pc-service','pc-contact','pc-date','pc-nombre','pc-motif','pc-complement']
 .forEach(fid=>{ const el=document.getElementById(fid); if(el) el.value=''; });document.getElementById('pc-nb-hint').textContent='';updateCourrierBadge();toast(`✅ Demande ${id} envoyée — ${nombre} courriers`);}
 function updateCourrierBadge() {const n = getCourriers().filter(c=>c.statut==='en_attente').length;const el = document.getElementById('courrier-sidebar-badge');if (!el) return;el.textContent = n || '';el.style.display = n>0 ? 'inline' : 'none';}
 function updateEntretienBadge() {const n = getEntretien().filter(e=>e.statut==='nouveau').length;const el = document.getElementById('entretien-sidebar-badge');if (!el) return;el.textContent = n || '';el.style.display = n>0 ? 'inline' : 'none';}
@@ -2116,10 +2401,7 @@ function filterCourrier(f, btn) {courrierFilter = f;btn.closest('.fbar').querySe
 function updateCourrierStatut(id, statut) {const list=getCourriers(), c=list.find(x=>x.id===id);if(c){ c.statut=statut; saveCourriers(list); updateCourrierBadge(); toast('✅ Statut mis à jour'); renderCourrierDir(); }}
 function saveCourrierComment(id) {const list=getCourriers(), c=list.find(x=>x.id===id);if(c){ c.commentaire=document.getElementById('ccmt-'+id)?.value||''; saveCourriers(list); toast('💾 Commentaire sauvegardé'); }}
 function exportCourrierCSV() {const list = getCourriers();let csv = '\uFEFF'+'ID;Nom;Direction;Service;Contact;Date envoi;Nombre;Statut;Motif;Complément;Date soumission\n';list.forEach(c=>{ csv += [c.id,c.nom,c.direction,c.service||'',c.contact||'',c.date,c.nombre,c.statut,`"${c.motif}"`,`"${c.complement||''}"`,c.datesoumission].join(';')+'\n'; });dl(csv, `courriers_envoi_nombre_${dSlug()}.csv`, 'text/csv;charset=utf-8');toast('📥 Export CSV téléchargé');}
-const VOLET_LABELS_MSG = {papier: '📄 Commandes Papier',fourni: '🖊️ Fournitures Administratives',mobilier: '🪑 Mobilier de Bureau',entretien:'🧹 Entretien des locaux',courrier: '✉️ Courrier — Envoi en nombre'};const CV_KEY = 'gf4_cv';const CVO_KEY = 'gf4_cvo';function getCV() { return LS.get(CV_KEY) || []; }
-function saveCV(v) { LS.set(CV_KEY, v); }
-function getCVO() { return LS.get(CVO_KEY) || []; }
-function saveCVO(v) { LS.set(CVO_KEY, v); }
+const VOLET_LABELS_MSG = {papier: '📄 Commandes Papier',fourni: '🖊️ Fournitures Administratives',mobilier: '🪑 Mobilier de Bureau',entretien:'🧹 Entretien des locaux',courrier: '✉️ Courrier — Envoi en nombre'};/* CV_KEY, getCV, saveCV, getCVO, saveCVO définis dans Firebase patch */
 function renderAgentCatNav() {const nav = document.getElementById('agent-cat-nav');if (!nav) return;nav.querySelectorAll('.cv-card').forEach(el => el.remove());getCV().forEach(cv => {const btn = document.createElement('button');btn.className = 'agent-cat-card cv-card v-custom';btn.id = 'ac-' + cv.id;btn.onclick = function() { switchAgentVolet(cv.id, this); };btn.innerHTML = '<span class="dmt-icon">' + cv.icone + '</span>'
 + '<span class="dmt-label">' + cv.label + '</span>'
 + '<span class="dmt-sub">' + (cv.desc||'') + '</span>';nav.appendChild(btn);injectCVStyle(cv.id);});}
@@ -2153,7 +2435,7 @@ function buildCVPanel(cv, today) {return '<div class="volet-header" style="backg
 function populateCVDir(id) {const sel = document.getElementById('cv-' + id + '-dir');if (!sel) return;const dirs = getDirections();sel.innerHTML = '<option value="">— Sélectionner —</option>'
 + dirs.map(d => '<option>' + d + '</option>').join('');}
 function populateAllCVDirs() {getCV().forEach(cv => populateCVDir(cv.id));}
-function submitCV(id) {const g = s => (document.getElementById(s)?.value||'').trim();const nom = g('cv-' + id + '-nom');const dir = g('cv-' + id + '-dir');const svc = g('cv-' + id + '-svc');const date = g('cv-' + id + '-date');const motif = g('cv-' + id + '-motif');const cv = getCV().find(x => x.id === id);if (!nom) return alert('Veuillez indiquer votre nom.');if (!dir) return alert('Veuillez sélectionner votre direction.');if (!date) return alert('Veuillez indiquer une date.');if (!motif) return alert('Veuillez décrire votre demande.');const n = getCounter(); saveCounter(n + 1);const oid = 'CUS-' + new Date().getFullYear() + '-' + String(n).padStart(4,'0');const list = getCVO();list.unshift({ id:oid, cvId:id, cvLabel:cv?.label||id,agent:nom, direction:dir, service:svc, date, motif,status:'en_attente', soumis:now(), commentaire:'' });saveCVO(list);document.getElementById('cv-' + id + '-nom').value = '';document.getElementById('cv-' + id + '-dir').value = '';document.getElementById('cv-' + id + '-svc').value = '';document.getElementById('cv-' + id + '-motif').value = '';updateCustomBadge();toast('✅ Demande ' + oid + ' envoyée !');}
+function submitCV(id) {const g = s => (document.getElementById(s)?.value||'').trim();const nom = g('cv-' + id + '-nom');const dir = g('cv-' + id + '-dir');const svc = g('cv-' + id + '-svc');const date = g('cv-' + id + '-date');const motif = g('cv-' + id + '-motif');const cv = getCV().find(x => x.id === id);if (!nom) return alert('Veuillez indiquer votre nom.');if (!dir) return alert('Veuillez sélectionner votre direction.');if (!date) return alert('Veuillez indiquer une date.');if (!motif) return alert('Veuillez décrire votre demande.');const n = getCounter(); saveCounter(n + 1);const oid = 'CUS-' + new Date().getFullYear() + '-' + String(n).padStart(4,'0');const list = getCVO();list.unshift({ id:oid, cvId:id, cvLabel:cv?.label||id,agent:nom, direction:dir, service:svc, date, motif,status:'en_attente', soumis:now(), commentaire:'' });saveCVO(list).catch(e=>console.warn(e));document.getElementById('cv-' + id + '-nom').value = '';document.getElementById('cv-' + id + '-dir').value = '';document.getElementById('cv-' + id + '-svc').value = '';document.getElementById('cv-' + id + '-motif').value = '';updateCustomBadge();toast('✅ Demande ' + oid + ' envoyée !');}
 function renderOngletsPanel() {const el = document.getElementById('onglets-panel');if (!el) return;const cvs = getCV();const orders = getCVO();const listHTML = cvs.length
 ? cvs.map((cv, i) => ''
 + '<div class="custom-volet-row">'
@@ -2202,7 +2484,7 @@ function moveCVItem(i, dir) {const cvs = getCV();const j = i + dir;if (j < 0 || 
 function setCVOStatus(id, status) {const list = getCVO();const o = list.find(x => x.id === id);if (o) { o.status = status; saveCVO(list); }
 updateCustomBadge();renderOngletsPanel();if (document.getElementById('custom-dir-panel')?.innerHTML) renderCustomDirPanel();toast('Statut mis à jour.');}
 function delCVOrder(id) {if (!confirm('Supprimer cette demande ?')) return;saveCVO(getCVO().filter(o => o.id !== id));renderOngletsPanel();toast('Demande supprimée.');}
-const getMessages = () => LS.get('gf4_messages') || {};const saveMessages = m => LS.set('gf4_messages', m);function renderMessagesPanel() {const el = document.getElementById('messages-panel');if (!el) return;const msgs = getMessages();const activeList = Object.entries(msgs).filter(([,m])=>m.text).map(([volet,m])=>`
+/* getMessages/saveMessages définis dans Firebase patch */function renderMessagesPanel() {const el = document.getElementById('messages-panel');if (!el) return;const msgs = getMessages();const activeList = Object.entries(msgs).filter(([,m])=>m.text).map(([volet,m])=>`
 <div class="compte-row" style="flex-wrap:wrap;gap:8px">
 <div style="font-size:18px">${VOLET_LABELS_MSG[volet]?.split(' ')[0]||'📢'}</div>
 <div class="compte-info">
@@ -2257,7 +2539,7 @@ const DEFAULT_DIRECTIONS = [
 ];const DEFAULT_FIELDS = {papier: [
 {key:'nom', label:'Nom et prénom', visible:true, required:true },{key:'svc', label:'Direction', visible:true, required:true },{key:'service',label:'Service / Unité', visible:true, required:false},{key:'site', label:'Site (si extérieur HDV)',visible:true, required:false},{key:'date', label:'Date souhaitée', visible:true, required:true },{key:'prio', label:'Priorité', visible:true, required:false},{key:'motif', label:'Motif', visible:true, required:true },{key:'libre', label:'Demande libre', visible:true, required:false},],fourni: [
 {key:'nom', label:'Nom et prénom', visible:true, required:true },{key:'svc', label:'Direction', visible:true, required:true },{key:'service',label:'Service / Unité', visible:true, required:false},{key:'site', label:'Site (si extérieur HDV)',visible:true, required:false},{key:'date', label:'Date souhaitée', visible:true, required:true },{key:'prio', label:'Priorité', visible:true, required:false},{key:'motif', label:'Motif', visible:true, required:true },{key:'libre', label:'Demande libre', visible:true, required:false},],mobilier: [
-{key:'nom', label:'Nom et prénom', visible:true, required:true },{key:'svc', label:'Direction', visible:true, required:true },{key:'service',label:'Service / Unité', visible:true, required:false},{key:'site', label:'Site (si extérieur HDV)',visible:true, required:false},{key:'adrliv', label:'Adresse de livraison', visible:true, required:false},{key:'local', label:'Local / Bureau dest.', visible:true, required:true },{key:'date', label:'Date souhaitée', visible:true, required:true },{key:'prio', label:'Priorité', visible:true, required:false},{key:'motif', label:'Motif / justification', visible:true, required:true },{key:'libre', label:'Demande libre', visible:true, required:false},],};const getDirections = () => LS.get('gf4_directions') || [...DEFAULT_DIRECTIONS];const saveDirections = d => LS.set('gf4_directions', d);const getFieldsConf = () => LS.get('gf4_fields') || JSON.parse(JSON.stringify(DEFAULT_FIELDS));const saveFieldsConf = f => LS.set('gf4_fields', f);function renderFormulairesPanel() {const el = document.getElementById('formulaires-panel');if (!el) return;const dirs = getDirections();const fields = getFieldsConf();const vNames = {papier:'📄 Commandes Papier', fourni:'🖊️ Fournitures Admin.', mobilier:'🪑 Mobilier de Bureau'};el.innerHTML = `
+{key:'nom', label:'Nom et prénom', visible:true, required:true },{key:'svc', label:'Direction', visible:true, required:true },{key:'service',label:'Service / Unité', visible:true, required:false},{key:'site', label:'Site (si extérieur HDV)',visible:true, required:false},{key:'adrliv', label:'Adresse de livraison', visible:true, required:false},{key:'local', label:'Local / Bureau dest.', visible:true, required:true },{key:'date', label:'Date souhaitée', visible:true, required:true },{key:'prio', label:'Priorité', visible:true, required:false},{key:'motif', label:'Motif / justification', visible:true, required:true },{key:'libre', label:'Demande libre', visible:true, required:false},],};/* getDirections, getFieldsConf etc. définis dans Firebase patch */function renderFormulairesPanel() {const el = document.getElementById('formulaires-panel');if (!el) return;const dirs = getDirections();const fields = getFieldsConf();const vNames = {papier:'📄 Commandes Papier', fourni:'🖊️ Fournitures Admin.', mobilier:'🪑 Mobilier de Bureau'};el.innerHTML = `
 <div class="form-section">
 <div class="form-section-head">🏢 Liste des directions (menu déroulant)</div>
 <div class="form-section-body">
@@ -2338,7 +2620,7 @@ onfocus="this.style.borderColor='var(--teal)'" onblur="this.style.borderColor='v
 </div>
 </div>`).join('')}`;}
 function addDir() {const inp = document.getElementById('new-dir-input');const val = inp?.value?.trim();if (!val) return alert('Veuillez saisir un nom de direction.');const dirs = getDirections();if (dirs.includes(val)) return alert('Cette direction existe déjà.');const idx = dirs.indexOf('Autre');dirs.splice(idx >= 0 ? idx : dirs.length, 0, val);saveDirections(dirs);inp.value='';toast(`✅ "${val}" ajoutée`);renderFormulairesPanel(); applyDirectionsToForms();}
-function deleteDir(i) {const dirs = getDirections();if (!confirm(`Supprimer "${dirs[i]}" ?`)) return;dirs.splice(i,1); saveDirections(dirs);renderFormulairesPanel(); applyDirectionsToForms();toast('🗑 Direction supprimée');}
+function deleteDir(i) {const dirs = getDirections();if (!confirm(`Supprimer "${dirs[i]}" ?`)) return;dirs.splice(i,1); saveDirections(dirs).catch(e=>console.warn(e));renderFormulairesPanel(); applyDirectionsToForms();toast('🗑 Direction supprimée');}
 function moveDir(i, dir) {const dirs = getDirections(), j = i+dir;if (j<0||j>=dirs.length) return;[dirs[i],dirs[j]]=[dirs[j],dirs[i]];saveDirections(dirs); renderFormulairesPanel(); applyDirectionsToForms();}
 function resetDirs() {if (!confirm('Réinitialiser la liste des directions ?')) return;saveDirections([...DEFAULT_DIRECTIONS]);renderFormulairesPanel(); applyDirectionsToForms();toast('✅ Liste réinitialisée');}
 function toggleField(volet, i, val) {const fields=getFieldsConf();fields[volet][i].visible=val;if (!val) fields[volet][i].required=false;saveFieldsConf(fields); renderFormulairesPanel(); applyFieldsToForms();}
@@ -2348,7 +2630,7 @@ function resetFields(volet) {const fields = getFieldsConf();const hasCustom = (f
 : `Réinitialiser les champs du volet ${volet} ?`;if (!confirm(msg)) return;const customFields = (fields[volet]||[]).filter(f => f.custom);fields[volet] = [...JSON.parse(JSON.stringify(DEFAULT_FIELDS[volet])), ...customFields];saveFieldsConf(fields); renderFormulairesPanel(); applyFieldsToForms();toast('✅ Champs réinitialisés');}
 function updateFieldLabel(volet, i, val) {const label = val.trim();if (!label) return;const fields = getFieldsConf();if (fields[volet][i].label === label) return;fields[volet][i].label = label;saveFieldsConf(fields);applyFieldsToForms();toast('✅ Libellé mis à jour');}
 function addCustomField(volet) {const labelEl = document.getElementById('ncf-label-' + volet);const typeEl = document.getElementById('ncf-type-' + volet);const label = labelEl?.value.trim();const type = typeEl?.value || 'text';if (!label) return alert('Veuillez saisir un libellé pour le champ.');const fields = getFieldsConf();const key = 'cx_' + Date.now();fields[volet].push({ key, label, type, visible: true, required: false, custom: true });saveFieldsConf(fields);if (labelEl) labelEl.value = '';renderFormulairesPanel();applyFieldsToForms();toast('✅ Champ "' + label + '" ajouté');}
-function deleteCustomField(volet, key) {if (!confirm('Supprimer ce champ personnalisé ?')) return;const fields = getFieldsConf();fields[volet] = fields[volet].filter(f => f.key !== key);saveFieldsConf(fields);renderFormulairesPanel();applyFieldsToForms();toast('🗑 Champ supprimé');}
+function deleteCustomField(volet, key) {if (!confirm('Supprimer ce champ personnalisé ?')) return;const fields = getFieldsConf();fields[volet] = fields[volet].filter(f => f.key !== key);saveFieldsConf(fields).catch(e=>console.warn(e));renderFormulairesPanel();applyFieldsToForms();toast('🗑 Champ supprimé');}
 function applyDirectionsToForms() {const dirs = getDirections();const opts = `<option value="">— Sélectionner —</option>`+dirs.map(d=>`<option>${d}</option>`).join('');['pp-svc','pf-svc','pm-svc','pe-svc','pc-dir'].forEach(id=>{ const el=document.getElementById(id); if(el) el.innerHTML=opts; });populateAllCVDirs();}
 function applyFieldsToForms() {const fields = getFieldsConf();const MAP = {papier: {nom:'pp-nom',svc:'pp-svc',service:'pp-service',site:'pp-site',date:'pp-date',prio:'pp-prio',motif:'pp-motif',libre:'pp-libre'},fourni: {nom:'pf-nom',svc:'pf-svc',service:'pf-service',site:'pf-site',date:'pf-date',prio:'pf-prio',motif:'pf-motif',libre:'pf-libre'},mobilier: {nom:'pm-nom',svc:'pm-svc',service:'pm-service',site:'pm-site',adrliv:'pm-adrliv',local:'pm-local',date:'pm-date',prio:'pm-prio',motif:'pm-motif',libre:'pm-libre'},};const VOLET_CLASS = { papier:'fg-papier', fourni:'fg-fourni', mobilier:'fg-mobilier' };['papier','fourni','mobilier'].forEach(v=>{(fields[v]||[]).forEach(f=>{if (f.custom) return;const inputId = MAP[v][f.key];if (!inputId) return;const wrap = document.getElementById(inputId)?.closest('.fg');if (!wrap) return;wrap.style.display = f.visible ? '' : 'none';const lbl = wrap.querySelector('label');if (lbl) {const reqSpan = lbl.querySelector('.req');lbl.childNodes.forEach(n => { if (n.nodeType === 3) n.remove(); });lbl.querySelectorAll('.req').forEach(r=>r.remove());lbl.prepend(document.createTextNode(f.label));if (f.required && f.visible) lbl.insertAdjacentHTML('beforeend','<span class="req"> *</span>');}});const container = document.getElementById('extras-' + v);if (!container) return;const customFields = (fields[v]||[]).filter(f => f.custom && f.visible);if (!customFields.length) { container.innerHTML = ''; return; }
 const cls = VOLET_CLASS[v];container.innerHTML = '<div class="fgrid" style="margin-top:4px">'
@@ -2408,9 +2690,9 @@ function init(){
   var peH=document.getElementById('pe-heure');if(peH)peH.value=nowTime;
   applyDirectionsToForms();applyFieldsToForms();applyBanners();renderCVPanels();renderAgentCatNav();
   var CAT_VER='5';
-  if(LS.get('gf3_cat_ver')!==CAT_VER){
+  if((_cache['gf3_cat_ver'])!==CAT_VER){
     VOLETS.forEach(function(v){
-      var stored=LS.get('gf3_inv_'+v)||[];
+      var stored=getInv(v);
       var cat=CATALOGUE[v]||[];
       // Reconstruire depuis catalogue en préservant les stocks
       var newInv=cat.map(function(a){
@@ -2424,12 +2706,20 @@ function init(){
       });
       saveInv(v,newInv);
     });
-    LS.set('gf3_cat_ver',CAT_VER);
+    (_cache['gf3_cat_ver']=CAT_VER);
   }
-  var _s=LS.get('gf_session');
+  var _s=getSession();
   if(_s&&_s.user){session=_s;nav('direction');}else{nav('agent');}
 }
-(function(){init();})();
+// Démarrage — attendre Firebase avant d'initialiser l'app
+(function(){
+  initFirebaseData().then(() => {
+    init();
+  }).catch(err => {
+    console.error('Erreur Firebase, démarrage en mode local:', err);
+    init(); // fallback
+  });
+})();
 
 // ── GESTION DES CATÉGORIES ──
 const GF_CATS_KEY = 'gf_user_cats';
@@ -2442,7 +2732,7 @@ function saveUserCats(arr) {
   localStorage.setItem(GF_CATS_KEY, JSON.stringify(arr));
 }
 function getAllCats(volet) {
-  const inv = LS.get('gf3_inv_'+volet) || [];
+  const inv = getInv(volet);
   const userCats = getUserCats();
   const catAll = [...new Set([
     ...Object.values(CATALOGUE).flatMap(v=>v.map(x=>x.categorie)),
@@ -2474,7 +2764,7 @@ function renameUserCat(oldCat, volet) {
   saveUserCats(cats);
   // Mettre à jour tous les articles qui portent l'ancien nom
   VOLETS.forEach(v => {
-    let inv = LS.get('gf3_inv_'+v) || [];
+    let inv = getInv(v);
     let changed = false;
     inv.forEach(a => { if (a.categorie === oldCat) { a.categorie = newName; changed = true; } });
     if (changed) saveInv(v, inv);
@@ -2488,7 +2778,7 @@ function openCatsFromArticle(volet, id) {
   const modal = document.getElementById('edit-article-modal');
   const allCats = getAllCats(volet);
   const invAll = [];
-  VOLETS.forEach(v => { (LS.get('gf3_inv_'+v)||[]).forEach(a => invAll.push(a)); });
+  VOLETS.forEach(v => { (getInv(v)).forEach(a => invAll.push(a)); });
   const countByCat = {};
   invAll.forEach(a => { if(a.categorie) countByCat[a.categorie] = (countByCat[a.categorie]||0)+1; });
   const dfrCats = new Set(Object.values(CATALOGUE).flatMap(v=>v.map(x=>x.categorie)).filter(Boolean));
@@ -2542,7 +2832,7 @@ function renameCatFromArticle(cat, volet, id) {
   const cats = getUserCats().map(c => c === cat ? newName : c);
   saveUserCats(cats);
   VOLETS.forEach(v => {
-    let inv = LS.get('gf3_inv_'+v) || [];
+    let inv = getInv(v);
     let changed = false;
     inv.forEach(a => { if (a.categorie === cat) { a.categorie = newName; changed = true; } });
     if (changed) saveInv(v, inv);
@@ -2574,7 +2864,7 @@ function openManageCatsModal(volet) {
   const allCats = getAllCats(volet);
   const userCats = getUserCats();
   const invAll = [];
-  VOLETS.forEach(v => { (LS.get('gf3_inv_'+v)||[]).forEach(a => invAll.push(a)); });
+  VOLETS.forEach(v => { (getInv(v)).forEach(a => invAll.push(a)); });
   const countByCat = {};
   invAll.forEach(a => { if(a.categorie) countByCat[a.categorie] = (countByCat[a.categorie]||0)+1; });
   const dfrCats = new Set(Object.values(CATALOGUE).flatMap(v=>v.map(x=>x.categorie)).filter(Boolean));
@@ -3059,7 +3349,7 @@ function drfImportAll() {
     var sid = 'drf-' + a.ref.replace(/[^a-z0-9]/gi,'-').toLowerCase().substring(0,40);
     var dest = a.dest;
     // Lire l'inventaire actuel depuis LS (pas le CATALOGUE)
-    var inv = LS.get('gf3_inv_' + dest) || [];
+    var inv = getInv(dest);
     // Si l'inventaire LS est vide, l'initialiser depuis le CATALOGUE
     if (inv.length === 0 && CATALOGUE[dest] && CATALOGUE[dest].length > 0) {
       inv = CATALOGUE[dest].map(function(x){ return Object.assign({},x); });
