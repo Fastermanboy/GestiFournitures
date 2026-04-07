@@ -1,5 +1,5 @@
-import { db } from "./firebase-config.js";
-import { ref, set, get, onValue } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-database.js";
+// firebase-init.js
+import { firebaseConfig } from './firebase-config.js';
 
-// Exemple : test de connexion
-set(ref(db, "test"), { ok: true });
+// Passer la config à l'initialisation Firebase intégrée dans index.html
+window.__gfFirebaseConfig = firebaseConfig;
