@@ -95,3 +95,11 @@ dbScript.onload = () => {
             type: "sortie",
             quantite: 3,
             date: Date.now()
+            }
+    });
+
+    console.log("Structure complète créée dans Firebase ✔️");
+};
+
+// Injection du premier script
+document.head.appendChild(appScript);
