@@ -1442,15 +1442,28 @@
 
 
 
-const DEFAULT_ACCOUNTS = {direction: { hash:'Admin1234', nom:'Direction Générale', service:'Direction Générale des Services', role:'admin' },admin: { hash:'Admin5678', nom:'Administrateur', service:'Service Informatique', role:'admin' }};
+const DEFAULT_ACCOUNTS = {direction: { hash:'60fe74406e7f353ed979f350f2fbb6a2e8690a5fa7d1b0c32983d1d8b3f95f67', nom:'Direction Générale', service:'Direction Générale des Services', role:'admin' },admin: { hash:'4ebdbd3afc7c601512c214d33d7be35478d007e42687f86a39ae48240d657cf1', nom:'Administrateur', service:'Service Informatique', role:'admin' }};
 const getAccounts = () => {
   const a = LS.get('gf4_accounts');
   if (a && typeof a === 'object' && Object.keys(a).length > 0) return a;
-  // Première utilisation : écrire les comptes par défaut dans Firebase
+  // Première utilisation : écrire les comptes par défaut (hachés) dans Firebase
   LS.set('gf4_accounts', DEFAULT_ACCOUNTS);
   return DEFAULT_ACCOUNTS;
 };
-const saveAccounts = a => LS.set('gf4_accounts', a);const VOLETS = ['papier','fourni','mobilier'];const VOLET_LABELS = { papier:'Papier', fourni:'Fournitures', mobilier:'Mobilier' };
+const saveAccounts = a => LS.set('gf4_accounts', a);
+
+// ── HACHAGE SHA-256 (Web Crypto API) ──
+async function hashPassword(pwd) {
+  const encoder = new TextEncoder();
+  const data = encoder.encode(pwd);
+  const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+  const hashArray = Array.from(new Uint8Array(hashBuffer));
+  return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+// Migration silencieuse : si un hash ressemble à un mot de passe en clair (< 64 chars),
+// on le rehache lors du prochain login réussi
+function isHashed(str) { return typeof str === 'string' && /^[a-f0-9]{64}$/.test(str); }const VOLETS = ['papier','fourni','mobilier'];const VOLET_LABELS = { papier:'Papier', fourni:'Fournitures', mobilier:'Mobilier' };
 function renderIcon(ico) {
   if (!ico) return '📦';
   if (!ico.startsWith('ico:')) return ico;
@@ -1751,7 +1764,37 @@ const saveHist = h => LS.set('gf3_hist', h);
 const getCounter = () => LS.get('gf3_ctr') || 1;
 const saveCounter = n => LS.set('gf3_ctr', n);
 
-function doLogin() {const u = document.getElementById('l-u').value.trim();const p = document.getElementById('l-p').value;const accounts = getAccounts();if (accounts[u] && accounts[u].hash === p) {session={user:u,nom:accounts[u].nom};LS.set('gf_session',session);document.getElementById('lerr').classList.remove('on');nav('direction');} else {document.getElementById('lerr').classList.add('on');}}
+async function doLogin() {
+  const u = document.getElementById('l-u').value.trim();
+  const p = document.getElementById('l-p').value;
+  const accounts = getAccounts();
+  const acc = accounts[u];
+  if (!acc) { document.getElementById('lerr').classList.add('on'); return; }
+
+  let ok = false;
+  if (isHashed(acc.hash)) {
+    // Mot de passe déjà haché SHA-256
+    const h = await hashPassword(p);
+    ok = (h === acc.hash);
+  } else {
+    // Mot de passe encore en clair (anciens comptes) — comparaison directe
+    ok = (p === acc.hash);
+    if (ok) {
+      // Migration automatique : on rehache et on sauvegarde
+      acc.hash = await hashPassword(p);
+      saveAccounts(accounts);
+    }
+  }
+
+  if (ok) {
+    session = { user: u, nom: acc.nom };
+    LS.set('gf_session', session);
+    document.getElementById('lerr').classList.remove('on');
+    nav('direction');
+  } else {
+    document.getElementById('lerr').classList.add('on');
+  }
+}
 function doLogout(){session={user:null,nom:null};try{LS.set('gf_session',null);}catch(e){}nav('agent');}
 
 // ══════════ FONCTIONS REMISE À ZÉRO ══════════
@@ -2678,7 +2721,24 @@ function renderComptes() {const accounts = getAccounts();const el = document.get
 </div>
 </div>`;}
 function checkPwdStrength(input, barId) {const v=input.value, bar=document.getElementById(barId);if(!bar) return;const score = [/.{8,}/, /[A-Z]/, /[0-9]/, /[^A-Za-z0-9]/].filter(r=>r.test(v)).length;const colors=['#E6007E','#EC6608','#009FE3','#3FA535'];const widths=['25%','50%','75%','100%'];bar.style.width = v.length ? widths[score-1]||'10%' : '0';bar.style.background = v.length ? colors[score-1]||'var(--red)' : 'transparent';}
-function createCompte() {const g = id => document.getElementById(id)?.value?.trim()||'';const login=g('nc-login'), nom=g('nc-nom'), svc=g('nc-svc'), role=g('nc-role');const pwd=document.getElementById('nc-pwd')?.value||'';const pwd2=document.getElementById('nc-pwd2')?.value||'';if (!login) return alert('L\'identifiant est obligatoire.');if (!nom) return alert('Le nom complet est obligatoire.');if (!pwd) return alert('Le mot de passe est obligatoire.');if (pwd.length < 8) return alert('Le mot de passe doit contenir au moins 8 caractères.');if (pwd !== pwd2) return alert('Les mots de passe ne correspondent pas.');const accounts = getAccounts();if (accounts[login]) return alert(`L'identifiant "${login}" existe déjà.`);accounts[login] = { hash:pwd, nom, service:svc, role };saveAccounts(accounts);toast(`✅ Compte "${login}" créé`);renderComptes();}
+async function createCompte() {
+  const g = id => document.getElementById(id)?.value?.trim()||'';
+  const login=g('nc-login'), nom=g('nc-nom'), svc=g('nc-svc'), role=g('nc-role');
+  const pwd=document.getElementById('nc-pwd')?.value||'';
+  const pwd2=document.getElementById('nc-pwd2')?.value||'';
+  if (!login) return alert('L\'identifiant est obligatoire.');
+  if (!nom) return alert('Le nom complet est obligatoire.');
+  if (!pwd) return alert('Le mot de passe est obligatoire.');
+  if (pwd.length < 8) return alert('Le mot de passe doit contenir au moins 8 caractères.');
+  if (pwd !== pwd2) return alert('Les mots de passe ne correspondent pas.');
+  const accounts = getAccounts();
+  if (accounts[login]) return alert(`L'identifiant "${login}" existe déjà.`);
+  const hashed = await hashPassword(pwd);
+  accounts[login] = { hash: hashed, nom, service: svc, role };
+  saveAccounts(accounts);
+  toast(`✅ Compte "${login}" créé`);
+  renderComptes();
+}
 function deleteCompte(login) {const accounts = getAccounts();if (Object.keys(accounts).length <= 1) return alert('Impossible de supprimer le dernier compte.');if (!confirm(`Supprimer le compte "${login}" ?`)) return;delete accounts[login];saveAccounts(accounts);toast(`🗑 Compte "${login}" supprimé`);renderComptes();}
 function openEditCompte(login) {const accounts = getAccounts();const a = accounts[login];if (!a) return;const modal = document.getElementById('edit-article-modal');modal.innerHTML = `
 <div class="modal">
@@ -2706,7 +2766,23 @@ function openEditCompte(login) {const accounts = getAccounts();const a = account
 <button class="badd-item" onclick="saveEditCompte('${login}')">💾 Enregistrer</button>
 </div>
 </div>`;modal.classList.add('on');}
-function saveEditCompte(login) {const g = id => document.getElementById(id)?.value?.trim()||'';const nom=g('ec-nom'), svc=g('ec-svc'), role=g('ec-role');const pwd=document.getElementById('ec-pwd')?.value||'';const pwd2=document.getElementById('ec-pwd2')?.value||'';if (pwd && pwd.length<8) return alert('Mot de passe trop court (min. 8 caractères).');if (pwd && pwd!==pwd2) return alert('Les mots de passe ne correspondent pas.');const accounts=getAccounts();accounts[login].nom=nom; accounts[login].service=svc; accounts[login].role=role;if (pwd) accounts[login].hash=pwd;saveAccounts(accounts);closeEditModal();toast(`✅ Compte "${login}" mis à jour`);renderComptes();}
+async function saveEditCompte(login) {
+  const g = id => document.getElementById(id)?.value?.trim()||'';
+  const nom=g('ec-nom'), svc=g('ec-svc'), role=g('ec-role');
+  const pwd=document.getElementById('ec-pwd')?.value||'';
+  const pwd2=document.getElementById('ec-pwd2')?.value||'';
+  if (pwd && pwd.length<8) return alert('Mot de passe trop court (min. 8 caractères).');
+  if (pwd && pwd!==pwd2) return alert('Les mots de passe ne correspondent pas.');
+  const accounts=getAccounts();
+  accounts[login].nom=nom;
+  accounts[login].service=svc;
+  accounts[login].role=role;
+  if (pwd) accounts[login].hash = await hashPassword(pwd);
+  saveAccounts(accounts);
+  closeEditModal();
+  toast(`✅ Compte "${login}" mis à jour`);
+  renderComptes();
+}
 function getEmojiVal(id) {return document.getElementById('epi-'+id)?.value || '📦';}
 document.addEventListener('click', e=>{if (!e.target.closest('.emoji-wrap')) {document.querySelectorAll('.emoji-dropdown.open').forEach(el=>{el.classList.remove('open');el.style.display='none';});}});function switchArticlesVolet(v, btn) {activeArticlesVolet = v;document.querySelectorAll('#ip-articles .pvt').forEach(b=>b.classList.remove('on'));btn.classList.add('on');['papier','fourni','mobilier'].forEach(x=>{ document.getElementById('art-'+x).style.display = x===v?'block':'none'; });renderArticlesPanel(v);}
 function renderArticlesPanel(volet) {const inv = getInv(volet);const el = document.getElementById('art-'+volet);if (!el) return;const cats = getAllCats(volet);const clr = `var(--c-${volet})`;const clrL = `var(--cl-${volet})`;el.innerHTML = `
