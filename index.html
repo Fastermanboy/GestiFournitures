@@ -1443,7 +1443,15 @@
 
 
 
-const DEFAULT_ACCOUNTS = {direction: { hash:'Admin1234', nom:'Direction Générale', service:'Direction Générale des Services', role:'admin' },admin: { hash:'Admin5678', nom:'Administrateur', service:'Service Informatique', role:'admin' }};const getAccounts = () => { const a=LS.get('gf4_accounts'); return a && typeof a === 'object' ? a : DEFAULT_ACCOUNTS; };const saveAccounts = a => LS.set('gf4_accounts', a);const VOLETS = ['papier','fourni','mobilier'];const VOLET_LABELS = { papier:'Papier', fourni:'Fournitures', mobilier:'Mobilier' };
+const DEFAULT_ACCOUNTS = {direction: { hash:'Admin1234', nom:'Direction Générale', service:'Direction Générale des Services', role:'admin' },admin: { hash:'Admin5678', nom:'Administrateur', service:'Service Informatique', role:'admin' }};
+const getAccounts = () => {
+  const a = LS.get('gf4_accounts');
+  if (a && typeof a === 'object' && Object.keys(a).length > 0) return a;
+  // Première utilisation : écrire les comptes par défaut dans Firebase
+  LS.set('gf4_accounts', DEFAULT_ACCOUNTS);
+  return DEFAULT_ACCOUNTS;
+};
+const saveAccounts = a => LS.set('gf4_accounts', a);const VOLETS = ['papier','fourni','mobilier'];const VOLET_LABELS = { papier:'Papier', fourni:'Fournitures', mobilier:'Mobilier' };
 function renderIcon(ico) {
   if (!ico) return '📦';
   if (!ico.startsWith('ico:')) return ico;
@@ -3230,7 +3238,20 @@ function init(){
     LS.set('gf3_cat_ver',CAT_VER);
   }
   var _s=LS.get('gf_session');
-  if(_s&&_s.user){session=_s;nav('direction');}else{nav('agent');}
+  if(_s&&_s.user){
+    // Vérifier que le compte existe toujours dans Firebase avant de restaurer la session
+    const _accounts = getAccounts();
+    if (_accounts[_s.user]) {
+      session=_s;
+      nav('direction');
+    } else {
+      // Compte supprimé ou inconnu — forcer reconnexion
+      LS.set('gf_session', null);
+      nav('agent');
+    }
+  } else {
+    nav('agent');
+  }
   window._GF_INITIALIZED = true;
 }
 
