@@ -9,6 +9,78 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
 <!-- Firebase SDK -->
+<script src="https://cdn.jsdelivr.net/npm/@emailjs/browser@4/dist/email.min.js"></script>
+<script>
+// ── EMAILJS CONFIG ──
+(function(){
+  emailjs.init({ publicKey: 'kgo3kFhPEeov7lfrw' });
+})();
+
+const EMAILJS_SERVICE_ID  = 'service_oz82paz';
+const EMAILJS_TEMPLATE_ID = 'template_hlilfhi';
+
+async function sendOrderEmail(order, status, cmt) {
+  if (!order.email) return; // Pas d'email renseigné
+
+  const VOLET_LABEL = { papier:'Papier', fourni:'Fournitures administratives', mobilier:'Mobilier de bureau' };
+  const arts = order.articles || [];
+  const artsServis  = arts.filter(a => a.prepStatus === 'servi');
+  const artsRestock = arts.filter(a => a.prepStatus === 'restock');
+  const artsRefuse  = arts.filter(a => a.prepStatus === 'refuse');
+
+  // Construction du résumé des articles
+  let articlesSummary = '';
+  if (artsServis.length) {
+    articlesSummary += '✅ Articles préparés :\n';
+    articlesSummary += artsServis.map(a => '  • ' + a.nom + ' : ' + (a.qtyServie || a.qty) + ' ' + (a.unite || 'unité(s)')).join('\n');
+  }
+  if (artsRestock.length) {
+    if (articlesSummary) articlesSummary += '\n\n';
+    articlesSummary += '🔄 En attente de réapprovisionnement :\n';
+    articlesSummary += artsRestock.map(a => '  • ' + a.nom).join('\n');
+  }
+  if (artsRefuse.length) {
+    if (articlesSummary) articlesSummary += '\n\n';
+    articlesSummary += '❌ Non disponibles :\n';
+    articlesSummary += artsRefuse.map(a => '  • ' + a.nom).join('\n');
+  }
+  if (!articlesSummary && order.libre) {
+    articlesSummary = order.libre;
+  }
+
+  const isRefus = status === 'refusee';
+  const isPartiel = status === 'en_attente_restock';
+
+  let statusLabel = '';
+  if (status === 'validee') statusLabel = '✅ Prête — retrait possible dès maintenant';
+  else if (isPartiel)       statusLabel = '🔄 Partiellement traitée — livraison partielle disponible';
+  else if (isRefus)         statusLabel = '❌ Refusée';
+
+  const prenomAgent = (order.agent || '').split(' ')[0] || (order.agent || 'Madame/Monsieur');
+
+  const templateParams = {
+    to_email        : order.email,
+    to_name         : order.agent || '',
+    prenom_agent    : prenomAgent,
+    order_id        : order.id,
+    order_date      : order.datesoumission || '',
+    status_label    : statusLabel,
+    volet_label     : VOLET_LABEL[order.volet] || order.volet,
+    articles_summary: articlesSummary || '(aucun détail)',
+    demandeur_nom   : order.agent || '',
+    demandeur_service: order.service_dir || order.service || '',
+    commentaire     : cmt ? 'Commentaire du gestionnaire : ' + cmt : '',
+  };
+
+  try {
+    await emailjs.send(EMAILJS_SERVICE_ID, EMAILJS_TEMPLATE_ID, templateParams);
+    toast('📧 Email envoyé à ' + order.email);
+  } catch(err) {
+    console.error('EmailJS error:', err);
+    toast('⚠️ Email non envoyé : ' + (err.text || err.message || 'erreur inconnue'), true);
+  }
+}
+</script>
 <script type="module">
   import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
   import { getDatabase, ref, get, set, onValue } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-database.js";
@@ -2214,36 +2286,9 @@ function processOrderFinale(id, status, cmt) {const orders = getOrders();const o
 const msg = status==='validee' ? '✅ Commande finalisée — stock déduit'
 : status==='en_attente_restock' ? '🔄 Commande partiellement traitée — articles en restock conservés'
 : '❌ Commande refusée';toast(msg);renderStatsMega(); renderAllOrders(); updateDirVoletCounts(); updatePrepBadge();renderPreparation();
-if ((status==='validee' || status==='en_attente_restock') && order.email) {
-  var artsServis = (order.articles||[]).filter(function(a){ return a.prepStatus==='servi'; });
-  var artsRestock = (order.articles||[]).filter(function(a){ return a.prepStatus==='restock'; });
-  var artsRefuse  = (order.articles||[]).filter(function(a){ return a.prepStatus==='refuse'; });
-  var VL = { papier:'Papier', fourni:'Fournitures administratives', mobilier:'Mobilier de bureau' };
-  var nl = '\n';
-  var lignesServis  = artsServis.map(function(a){ return '  - '+a.nom+' : '+(a.qtyServie||a.qty)+' '+(a.unite||'unite(s)'); }).join(nl);
-  var lignesRestock = artsRestock.map(function(a){ return '  - '+a.nom+' (en reliquat)'; }).join(nl);
-  var lignesRefuse  = artsRefuse.map(function(a){ return '  - '+a.nom; }).join(nl);
-  var isPartiel = status==='en_attente_restock';
-  var prenomAgent = (order.agent||'').split(' ')[0] || order.agent;
-  var sujet = isPartiel
-    ? '[GestiFournitures] Commande ' + id + ' \u2013 livraison partielle'
-    : '[GestiFournitures] Votre commande ' + id + ' est pr\u00eate \u00e0 \u00eatre retir\u00e9e';
-  var corps = 'Bonjour ' + prenomAgent + ',' + nl + nl;
-  if (!isPartiel) {
-    corps += 'Nous avons le plaisir de vous informer que votre commande ' + id + ' (' + (VL[order.volet]||order.volet) + ') est pr\u00eate et disponible.' + nl;
-    corps += 'Vous pouvez la r\u00e9cup\u00e9rer d\u00e8s \u00e0 pr\u00e9sent \u00e0 la salle des fournitures (Direction des Moyens G\u00e9n\u00e9raux, Mairie de Savigny-le-Temple).' + nl + nl;
-    if (lignesServis) corps += 'D\u00e9tail des articles pr\u00e9par\u00e9s :' + nl + lignesServis + nl + nl;
-  } else {
-    corps += 'Votre commande ' + id + ' (' + (VL[order.volet]||order.volet) + ') a \u00e9t\u00e9 partiellement trait\u00e9e.' + nl + nl;
-    if (lignesServis)  corps += 'Articles disponibles (retrait imm\u00e9diat) :' + nl + lignesServis + nl + nl;
-    if (lignesRestock) corps += 'Articles en attente de r\u00e9approvisionnement (livraison ult\u00e9rieure) :' + nl + lignesRestock + nl + nl;
-  }
-  if (lignesRefuse) corps += 'Articles non disponibles :' + nl + lignesRefuse + nl + nl;
-  if (cmt) corps += 'Commentaire du gestionnaire : ' + cmt + nl + nl;
-  corps += 'Pour toute question, n\u2019h\u00e9sitez pas \u00e0 nous contacter.' + nl + nl;
-  corps += 'Cordialement,' + nl + 'Direction des Moyens G\u00e9n\u00e9raux et de la Commande Publique' + nl + 'Mairie de Savigny-le-Temple';
-  var mailto = 'mailto:'+encodeURIComponent(order.email)+'?subject='+encodeURIComponent(sujet)+'&body='+encodeURIComponent(corps);
-  setTimeout(function(){ window.location.href = mailto; }, 800);
+// ── Envoi email via EmailJS ──
+if (status === 'validee' || status === 'en_attente_restock' || status === 'refusee') {
+  sendOrderEmail(order, status, cmt);
 }
 }
 function printPreparation() {
